@@ -1,9 +1,41 @@
 use anyhow::{Context, Result, anyhow};
+use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+fn resolve_home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(userprofile) = env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(userprofile));
+        }
+
+        if let (Some(mut homedrive), Some(homepath)) =
+            (env::var_os("HOMEDRIVE"), env::var_os("HOMEPATH"))
+        {
+            if !homedrive.is_empty() && !homepath.is_empty() {
+                homedrive.push(homepath);
+                return Some(PathBuf::from(homedrive));
+            }
+        }
+
+        env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+
+    #[cfg(not(windows))]
+    {
+        env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+}
+
 pub fn wsx_home() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
+    let home = resolve_home_dir().ok_or_else(|| {
+        anyhow!("failed to resolve home directory from environment variables")
+    })?;
     Ok(home.join(".config").join("wsx"))
 }
 
