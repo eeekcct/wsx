@@ -2,6 +2,11 @@
 
 A CLI tool for switching development workspaces and managing grouped processes safely.
 
+## Status
+
+This project is under active development.
+Behavior and configuration may change until the first stable release.
+
 ## Features
 
 - Switch workspaces with one command (`wsx <workspace>`)
@@ -14,7 +19,9 @@ A CLI tool for switching development workspaces and managing grouped processes s
 
 ## Installation
 
-Build from source:
+Download pre-built binaries from [Releases](https://github.com/eeekcct/wsx/releases).
+
+Build from source (optional):
 
 ```sh
 cargo build --release
