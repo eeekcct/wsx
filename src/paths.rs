@@ -33,9 +33,8 @@ fn resolve_home_dir() -> Option<PathBuf> {
 }
 
 pub fn wsx_home() -> Result<PathBuf> {
-    let home = resolve_home_dir().ok_or_else(|| {
-        anyhow!("failed to resolve home directory from environment variables")
-    })?;
+    let home = resolve_home_dir()
+        .ok_or_else(|| anyhow!("failed to resolve home directory from environment variables"))?;
     Ok(home.join(".config").join("wsx"))
 }
 
