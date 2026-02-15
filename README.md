@@ -11,6 +11,7 @@ It is not production-ready yet, and some commands may fail depending on environm
 ## Features
 
 - Switch workspaces with one command (`wsx <workspace>`)
+- List configured workspaces (`wsx list`)
 - Start/stop multiple processes per workspace
 - Stop the current workspace before starting the next one
 - Apply environment variables in order: OS -> dotenv -> envrc
@@ -46,6 +47,9 @@ cargo run -- <args>
 # Switch to workspace "deva"
 wsx deva
 
+# List configured workspaces
+wsx list
+
 # Show default log target
 wsx logs
 
@@ -70,46 +74,25 @@ Config file location:
 ~/.config/wsx/config.yaml
 ```
 
-Example:
+Minimal example:
 
 ```yaml
 defaults:
-  stop:
-    grace_seconds: 5
   env:
     dotenv: [.env]
     envrc: false
-  logs:
-    lines: 200
-    keep_instances: 20
 
 workspaces:
   deva:
     path: /path/to/clone-a
-    env:
-      dotenv: [.env, .env.local]
-      envrc: true
-    logs:
-      # Optional: explicit default target
-      # default: backend:out
-      keep_instances: 20
     processes:
-      - name: frontend
-        cmd: ["npm", "run", "dev"]
       - name: backend
-        default_log: true
-        default_stream: err
         cmd: ["go", "run", "./cmd/server"]
-      - name: worker
-        cmd: ["cargo", "run", "--bin", "worker"]
 ```
 
-Default log target resolution order:
+Full config reference:
 
-1. `workspace.logs.default`
-2. `defaults.logs.default`
-3. `processes` entry with `default_log: true`
-4. The first process in `processes`
+- `docs/CONFIG.md`
 
 ## Requirements
 

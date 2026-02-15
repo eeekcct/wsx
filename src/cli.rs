@@ -37,6 +37,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    List,
     Down,
     Logs {
         #[arg(value_name = "target")]

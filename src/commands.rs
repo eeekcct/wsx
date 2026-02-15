@@ -16,6 +16,7 @@ use crate::state::{self, CurrentState};
 pub fn run(cli: Cli) -> Result<()> {
     match (cli.workspace, cli.command) {
         (Some(workspace), None) => switch_workspace(&workspace),
+        (None, Some(Command::List)) => list_workspaces(),
         (None, Some(Command::Down)) => down_current(None),
         (None, Some(Command::Logs { target, lines })) => logs_current(target, lines),
         (None, Some(Command::Status)) => status_current(),
@@ -51,6 +52,26 @@ fn switch_workspace(workspace_name: &str) -> Result<()> {
         workspace.logs_keep_instances,
         Some(&pids.instance_id),
     )?;
+    Ok(())
+}
+
+fn list_workspaces() -> Result<()> {
+    let config = Config::load()?;
+    let current_workspace = match state::load_current() {
+        Ok(Some(current)) => Some(current.workspace),
+        Ok(None) => None,
+        Err(err) => {
+            eprintln!("warning: current state is invalid, ignoring it: {err:#}");
+            None
+        }
+    };
+
+    let workspace_names: Vec<String> = config.workspaces.keys().cloned().collect();
+    let lines = render_workspace_list(workspace_names, current_workspace.as_deref());
+    for line in lines {
+        println!("{line}");
+    }
+
     Ok(())
 }
 
@@ -288,4 +309,43 @@ fn cleanup_workspace_instances(
     }
 
     Ok(())
+}
+
+fn render_workspace_list(
+    mut workspace_names: Vec<String>,
+    current_workspace: Option<&str>,
+) -> Vec<String> {
+    workspace_names.sort();
+    workspace_names
+        .into_iter()
+        .map(|workspace_name| {
+            if current_workspace.is_some_and(|current| current == workspace_name) {
+                format!("* {workspace_name}")
+            } else {
+                format!("  {workspace_name}")
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_workspace_list;
+
+    #[test]
+    fn workspace_list_is_sorted_and_marks_current() {
+        let lines = render_workspace_list(
+            vec!["zeta".to_string(), "alpha".to_string(), "beta".to_string()],
+            Some("beta"),
+        );
+
+        assert_eq!(lines, vec!["  alpha", "* beta", "  zeta"]);
+    }
+
+    #[test]
+    fn workspace_list_without_current_marks_none() {
+        let lines = render_workspace_list(vec!["b".to_string(), "a".to_string()], None);
+
+        assert_eq!(lines, vec!["  a", "  b"]);
+    }
 }
