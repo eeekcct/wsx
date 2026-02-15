@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
-use sysinfo::{Pid, System};
+use sysinfo::{Pid, ProcessStatus, System};
 
 use crate::state::{PidEntry, PidsFile};
 
@@ -220,7 +220,13 @@ fn ensure_file(path: &Path) -> Result<()> {
 fn is_pid_running(pid: u32) -> bool {
     let mut system = System::new_all();
     system.refresh_all();
-    system.process(Pid::from_u32(pid)).is_some()
+    match system.process(Pid::from_u32(pid)) {
+        Some(process) => !matches!(
+            process.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        ),
+        None => false,
+    }
 }
 
 #[cfg(test)]

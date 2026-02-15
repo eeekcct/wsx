@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, System};
+use sysinfo::{Pid, ProcessStatus, System};
 
 use crate::config::ResolvedWorkspace;
 use crate::paths;
@@ -131,7 +131,13 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
 pub fn is_pid_running(pid: u32) -> bool {
     let mut system = System::new_all();
     system.refresh_all();
-    system.process(Pid::from_u32(pid)).is_some()
+    match system.process(Pid::from_u32(pid)) {
+        Some(process) => !matches!(
+            process.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        ),
+        None => false,
+    }
 }
 
 #[cfg(unix)]
