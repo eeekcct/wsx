@@ -6,6 +6,7 @@ A CLI tool for switching development workspaces and managing grouped processes s
 
 This project is under active development.
 Behavior and configuration may change until the first stable release.
+It is not production-ready yet, and some commands may fail depending on environment or incomplete features.
 
 ## Features
 
