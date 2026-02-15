@@ -1,0 +1,13 @@
+name: Release
+on:
+  push:
+    tags:
+      - "v*"
+jobs:
+  release:
+    uses: eeekcct/goreleaser-rust-workflow/.github/workflows/release.yml@d8810f9605f7ad72b2529b8776d496ff870c3f54 # v0.2.0
+    permissions:
+      contents: write
+      id-token: write
+      actions: read
+      attestations: write
