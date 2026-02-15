@@ -1,5 +1,6 @@
 #[cfg(target_os = "linux")]
 mod linux_e2e {
+    use serde::Deserialize;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
@@ -76,6 +77,10 @@ mod linux_e2e {
                 .env_remove("WSX_HOME");
             cmd.output().expect("failed to execute wsx")
         }
+
+        fn wsx_home(&self) -> PathBuf {
+            self.home_dir.join(".config").join("wsx")
+        }
     }
 
     fn yaml_path(path: &Path) -> String {
@@ -107,6 +112,63 @@ mod linux_e2e {
             stdout(output),
             stderr(output)
         );
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PidsMeta {
+        workspace: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct CurrentMeta {
+        instance_id: String,
+    }
+
+    fn workspace_instance_ids(env: &TestEnv, workspace_name: &str) -> Vec<String> {
+        let instances_dir = env.wsx_home().join("instances");
+        if !instances_dir.exists() {
+            return vec![];
+        }
+
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&instances_dir).expect("failed to read instances dir") {
+            let entry = entry.expect("failed to read instances entry");
+            if !entry
+                .file_type()
+                .expect("failed to read file type")
+                .is_dir()
+            {
+                continue;
+            }
+
+            let instance_id = entry.file_name().to_string_lossy().to_string();
+            let pids_path = entry.path().join("pids.json");
+            if !pids_path.exists() {
+                continue;
+            }
+
+            let raw = fs::read_to_string(&pids_path).expect("failed to read pids file");
+            let Ok(meta) = serde_json::from_str::<PidsMeta>(&raw) else {
+                continue;
+            };
+            if meta.workspace == workspace_name {
+                out.push(instance_id);
+            }
+        }
+
+        out.sort();
+        out
+    }
+
+    fn current_instance_id(env: &TestEnv) -> Option<String> {
+        let current_path = env.wsx_home().join("current.json");
+        if !current_path.exists() {
+            return None;
+        }
+
+        let raw = fs::read_to_string(current_path).expect("failed to read current.json");
+        let current: CurrentMeta = serde_json::from_str(&raw).expect("invalid current.json");
+        Some(current.instance_id)
     }
 
     #[test]
@@ -237,6 +299,198 @@ workspaces:
         let logs_err = env.run(&["logs", "backend:err"]);
         assert_success(&logs_err);
         assert!(stdout(&logs_err).contains("backend-err"));
+    }
+
+    #[test]
+    fn multi_process_workspace_status_and_logs_targets_work() {
+        let env = TestEnv::new("multi-process");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: api
+        default_log: true
+        cmd: ["sh", "-lc", "echo api-out; echo api-err 1>&2; sleep 1"]
+      - name: worker
+        cmd: ["sh", "-lc", "echo worker-out; echo worker-err 1>&2; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let status = env.run(&["status"]);
+        assert_success(&status);
+        let status_out = stdout(&status);
+        assert!(status_out.contains("- api (pid "));
+        assert!(status_out.contains("- worker (pid "));
+
+        let logs_api = env.run(&["logs", "api"]);
+        assert_success(&logs_api);
+        let logs_api_out = stdout(&logs_api);
+        assert!(logs_api_out.contains("api-out"));
+        assert!(logs_api_out.contains("api-err"));
+
+        let logs_worker_err = env.run(&["logs", "worker:err"]);
+        assert_success(&logs_worker_err);
+        assert!(stdout(&logs_worker_err).contains("worker-err"));
+
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        assert!(stdout(&down).contains("stopped workspace `demo`"));
+    }
+
+    #[test]
+    fn keep_instances_trims_old_runs_to_limit() {
+        let env = TestEnv::new("keep-trim");
+        let cleanup = env.create_workspace("cleanup");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+  logs:
+    keep_instances: 2
+workspaces:
+  cleanup:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo cleanup; sleep 1"]
+"#,
+            yaml_path(&cleanup),
+        ));
+
+        for _ in 0..4 {
+            let run = env.run(&["cleanup"]);
+            assert_success(&run);
+        }
+
+        let instance_ids = workspace_instance_ids(&env, "cleanup");
+        assert_eq!(
+            instance_ids.len(),
+            2,
+            "cleanup should retain exactly 2 instances"
+        );
+
+        let current_instance_id =
+            current_instance_id(&env).expect("current instance should exist after switch");
+        assert!(
+            instance_ids.iter().any(|id| id == &current_instance_id),
+            "latest current instance must be retained"
+        );
+    }
+
+    #[test]
+    fn keep_instances_zero_disables_cleanup() {
+        let env = TestEnv::new("keep-zero");
+        let noclean = env.create_workspace("noclean");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+  logs:
+    keep_instances: 0
+workspaces:
+  noclean:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo noclean; sleep 1"]
+"#,
+            yaml_path(&noclean),
+        ));
+
+        for expected_count in 1..=4 {
+            let run = env.run(&["noclean"]);
+            assert_success(&run);
+
+            let instance_ids = workspace_instance_ids(&env, "noclean");
+            assert_eq!(
+                instance_ids.len(),
+                expected_count,
+                "keep_instances=0 should not delete old instances"
+            );
+        }
+    }
+
+    #[test]
+    fn keep_instances_is_scoped_per_workspace() {
+        let env = TestEnv::new("keep-scope");
+        let alpha = env.create_workspace("alpha");
+        let beta = env.create_workspace("beta");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  alpha:
+    path: {}
+    logs:
+      keep_instances: 1
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo alpha; sleep 1"]
+  beta:
+    path: {}
+    logs:
+      keep_instances: 1
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo beta; sleep 1"]
+"#,
+            yaml_path(&alpha),
+            yaml_path(&beta),
+        ));
+
+        for _ in 0..3 {
+            let run_alpha = env.run(&["alpha"]);
+            assert_success(&run_alpha);
+
+            let run_beta = env.run(&["beta"]);
+            assert_success(&run_beta);
+        }
+
+        let alpha_instances = workspace_instance_ids(&env, "alpha");
+        let beta_instances = workspace_instance_ids(&env, "beta");
+        assert_eq!(
+            alpha_instances.len(),
+            1,
+            "alpha should retain only one instance"
+        );
+        assert_eq!(
+            beta_instances.len(),
+            1,
+            "beta should retain only one instance"
+        );
+
+        let current_instance_id =
+            current_instance_id(&env).expect("current instance should exist after switch");
+        assert!(
+            beta_instances.iter().any(|id| id == &current_instance_id),
+            "current instance should be beta's latest instance"
+        );
     }
 
     #[test]
