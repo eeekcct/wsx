@@ -85,7 +85,15 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<()> {
         }
 
         if !had_delta && !is_pid_running(entry.pid) {
-            return Ok(());
+            rebuild_combined(&out, &err, &combined)?;
+            let final_delta = read_from_offset(&combined, combined_pos)?;
+            if final_delta.is_empty() {
+                return Ok(());
+            }
+
+            print!("{}", String::from_utf8_lossy(&final_delta));
+            std::io::stdout().flush().ok();
+            combined_pos += final_delta.len() as u64;
         }
 
         thread::sleep(Duration::from_millis(250));
@@ -118,7 +126,14 @@ fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<()> {
         }
 
         if !had_delta && !is_pid_running(pid) {
-            return Ok(());
+            let final_delta = read_from_offset(path, pos)?;
+            if final_delta.is_empty() {
+                return Ok(());
+            }
+
+            print!("{}", String::from_utf8_lossy(&final_delta));
+            std::io::stdout().flush().ok();
+            pos += final_delta.len() as u64;
         }
 
         thread::sleep(Duration::from_millis(250));

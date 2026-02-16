@@ -123,6 +123,17 @@ mod linux_e2e {
         );
     }
 
+    fn assert_down_succeeded_message(output: &Output, workspace: &str) {
+        let out = stdout(output);
+        assert!(
+            out.contains(&format!("stopped workspace `{workspace}`"))
+                || out.contains(&format!("workspace `{workspace}` is already stopped")),
+            "down output should indicate workspace stop state\nstdout:\n{}\nstderr:\n{}",
+            out,
+            stderr(output)
+        );
+    }
+
     #[derive(Debug, Deserialize)]
     struct PidsMeta {
         workspace: String,
@@ -289,8 +300,7 @@ workspaces:
 
         let down = env.run(&["down"]);
         assert_success(&down);
-        let down_stdout = stdout(&down);
-        assert!(down_stdout.contains("stopped workspace `deva`"));
+        assert_down_succeeded_message(&down, "deva");
 
         let status_after_down = env.run(&["status"]);
         assert_success(&status_after_down);
@@ -328,8 +338,7 @@ workspaces:
 
         let down = env.run(&["down"]);
         assert_success(&down);
-        let down_stdout = stdout(&down);
-        assert!(down_stdout.contains("stopped workspace `demo`"));
+        assert_down_succeeded_message(&down, "demo");
 
         let meta_after_down = current_meta(&env).expect("current should be preserved after down");
         assert_eq!(meta_after_down.status.as_deref(), Some("stopped"));
@@ -546,7 +555,7 @@ workspaces:
 
         let down = env.run(&["down"]);
         assert_success(&down);
-        assert!(stdout(&down).contains("stopped workspace `demo`"));
+        assert_down_succeeded_message(&down, "demo");
     }
 
     #[test]

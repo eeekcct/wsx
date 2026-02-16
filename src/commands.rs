@@ -163,12 +163,6 @@ fn logs_current(target: Option<String>, lines: Option<usize>, follow: bool) -> R
 
 fn exec_current(cmd: Vec<String>) -> Result<()> {
     let current = load_current_reconciled()?.context("no current workspace")?;
-    if current.status == CurrentStatus::Stopped {
-        bail!(
-            "current workspace `{}` is stopped; run `wsx up` first",
-            current.workspace
-        );
-    }
 
     let config = Config::load()?;
     let workspace = config.resolve_workspace(&current.workspace)?;
