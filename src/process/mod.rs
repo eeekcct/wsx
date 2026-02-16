@@ -4,7 +4,6 @@ use std::fs::{self, OpenOptions};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-#[cfg(windows)]
 use sysinfo::{Pid, ProcessStatus, System};
 
 use crate::config::ResolvedWorkspace;
@@ -152,26 +151,15 @@ fn running_entries<'a>(pids_file: &'a PidsFile) -> Vec<&'a PidEntry> {
 }
 
 pub fn is_pid_running(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        return unix::is_running(pid);
+    let mut system = System::new_all();
+    system.refresh_all();
+    match system.process(Pid::from_u32(pid)) {
+        Some(process) => !matches!(
+            process.status(),
+            ProcessStatus::Zombie | ProcessStatus::Dead
+        ),
+        None => false,
     }
-
-    #[cfg(windows)]
-    {
-        let mut system = System::new_all();
-        system.refresh_all();
-        return match system.process(Pid::from_u32(pid)) {
-            Some(process) => !matches!(
-                process.status(),
-                ProcessStatus::Zombie | ProcessStatus::Dead
-            ),
-            None => false,
-        };
-    }
-
-    #[allow(unreachable_code)]
-    false
 }
 
 #[cfg(unix)]
