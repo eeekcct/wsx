@@ -205,11 +205,12 @@ If the selected process has `default_stream`, it becomes `<name>:<stream>`.
 
 ### `.envrc` execution
 
-- Unix: `sh -lc "set -a; . ./.envrc; env"`
-- Windows: `bash -lc "set -a; source ./.envrc; env"`
+- Unix: `sh -c "set -a; . ./.envrc; env"`
+- Windows: `bash -c "set -a; source ./.envrc; env"`
 
 Notes:
 
+- `.envrc` is evaluated with a non-login shell (`-c`) for deterministic PATH/toolchain behavior.
 - If `envrc: true` but `.envrc` is missing, it is skipped.
 - On Windows, if `bash` is not found, `.envrc` is skipped with warning.
 - If `.envrc` execution fails, workspace startup fails.

@@ -50,7 +50,7 @@ fn apply_envrc(workspace_path: &Path, env_map: &mut HashMap<String, String>) -> 
     #[cfg(unix)]
     {
         let output = Command::new("sh")
-            .arg("-lc")
+            .arg("-c")
             .arg("set -a; . ./.envrc; env")
             .current_dir(workspace_path)
             .env_clear()
@@ -71,7 +71,7 @@ fn apply_envrc(workspace_path: &Path, env_map: &mut HashMap<String, String>) -> 
     #[cfg(windows)]
     {
         let output = Command::new("bash")
-            .arg("-lc")
+            .arg("-c")
             .arg("set -a; source ./.envrc; env")
             .current_dir(workspace_path)
             .env_clear()

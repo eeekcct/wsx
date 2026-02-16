@@ -141,7 +141,10 @@ pub fn is_pid_running(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn apply_spawn_settings(_command: &mut Command) {}
+fn apply_spawn_settings(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
 
 #[cfg(windows)]
 fn apply_spawn_settings(command: &mut Command) {
