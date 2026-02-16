@@ -250,7 +250,10 @@ fn load_current_reconciled() -> Result<Option<CurrentState>> {
         Err(_) => return Ok(Some(current)),
     };
 
-    let has_running_pid = pids.entries.iter().any(|entry| process::is_pid_running(entry.pid));
+    let has_running_pid = pids
+        .entries
+        .iter()
+        .any(|entry| process::is_pid_running(entry.pid));
     if !has_running_pid {
         current.status = CurrentStatus::Stopped;
         state::save_current(&current)?;
