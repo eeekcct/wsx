@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::process::{Command, Stdio};
@@ -109,11 +109,7 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
 
     let deadline = Instant::now() + Duration::from_secs(grace_seconds);
     while Instant::now() < deadline {
-        if pids_file
-            .entries
-            .iter()
-            .all(|entry| !is_pid_running(entry.pid))
-        {
+        if running_entries(pids_file).is_empty() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(200));
@@ -125,7 +121,33 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
         }
     }
 
+    let force_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < force_deadline {
+        if running_entries(pids_file).is_empty() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    let remaining = running_entries(pids_file);
+    if !remaining.is_empty() {
+        let details = remaining
+            .into_iter()
+            .map(|entry| format!("{} (pid {})", entry.name, entry.pid))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("failed to stop processes: {details}");
+    }
+
     Ok(())
+}
+
+fn running_entries<'a>(pids_file: &'a PidsFile) -> Vec<&'a PidEntry> {
+    pids_file
+        .entries
+        .iter()
+        .filter(|entry| is_pid_running(entry.pid))
+        .collect()
 }
 
 pub fn is_pid_running(pid: u32) -> bool {

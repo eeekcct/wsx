@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
-use sysinfo::{Pid, ProcessStatus, System};
 
+use crate::process;
 use crate::state::{PidEntry, PidsFile};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,11 +50,16 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<()> {
         return Ok(());
     }
 
+    let detach_rx = spawn_detach_listener();
     let mut out_pos = file_len(&out)?;
     let mut err_pos = file_len(&err)?;
     let mut combined_pos = file_len(&combined)?;
 
     loop {
+        if should_detach(&detach_rx) {
+            return Ok(());
+        }
+
         let mut had_delta = false;
 
         let out_delta = read_from_offset(&out, out_pos)?;
@@ -79,7 +85,15 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<()> {
         }
 
         if !had_delta && !is_pid_running(entry.pid) {
-            return Ok(());
+            rebuild_combined(&out, &err, &combined)?;
+            let final_delta = read_from_offset(&combined, combined_pos)?;
+            if final_delta.is_empty() {
+                return Ok(());
+            }
+
+            print!("{}", String::from_utf8_lossy(&final_delta));
+            std::io::stdout().flush().ok();
+            combined_pos += final_delta.len() as u64;
         }
 
         thread::sleep(Duration::from_millis(250));
@@ -94,8 +108,13 @@ fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<()> {
         return Ok(());
     }
 
+    let detach_rx = spawn_detach_listener();
     let mut pos = file_len(path)?;
     loop {
+        if should_detach(&detach_rx) {
+            return Ok(());
+        }
+
         let mut had_delta = false;
 
         let delta = read_from_offset(path, pos)?;
@@ -107,7 +126,14 @@ fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<()> {
         }
 
         if !had_delta && !is_pid_running(pid) {
-            return Ok(());
+            let final_delta = read_from_offset(path, pos)?;
+            if final_delta.is_empty() {
+                return Ok(());
+            }
+
+            print!("{}", String::from_utf8_lossy(&final_delta));
+            std::io::stdout().flush().ok();
+            pos += final_delta.len() as u64;
         }
 
         thread::sleep(Duration::from_millis(250));
@@ -217,16 +243,44 @@ fn ensure_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn is_pid_running(pid: u32) -> bool {
-    let mut system = System::new_all();
-    system.refresh_all();
-    match system.process(Pid::from_u32(pid)) {
-        Some(process) => !matches!(
-            process.status(),
-            ProcessStatus::Zombie | ProcessStatus::Dead
-        ),
-        None => false,
+fn spawn_detach_listener() -> Option<Receiver<()>> {
+    if !std::io::stdin().is_terminal() {
+        return None;
     }
+
+    eprintln!("[wsx] following logs (press q + Enter to detach)");
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        loop {
+            let mut line = String::new();
+            if stdin.read_line(&mut line).is_err() {
+                break;
+            }
+            if line.trim().eq_ignore_ascii_case("q") {
+                let _ = tx.send(());
+                break;
+            }
+        }
+    });
+
+    Some(rx)
+}
+
+fn should_detach(detach_rx: &Option<Receiver<()>>) -> bool {
+    match detach_rx {
+        None => false,
+        Some(rx) => match rx.try_recv() {
+            Ok(_) => true,
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => false,
+        },
+    }
+}
+
+fn is_pid_running(pid: u32) -> bool {
+    process::is_pid_running(pid)
 }
 
 #[cfg(test)]

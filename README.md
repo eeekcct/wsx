@@ -10,14 +10,11 @@ It is not production-ready yet, and some commands may fail depending on environm
 
 ## Features
 
-- Switch workspaces with one command (`wsx <workspace>`)
-- List configured workspaces (`wsx list`)
-- Start/stop multiple processes per workspace
-- Stop the current workspace before starting the next one
-- Apply environment variables in order: OS -> dotenv -> envrc
-- View logs by default target, process, or stream (`combined` / `out` / `err`)
-- Persist runtime state outside repositories (`~/.config/wsx`)
-- Keep only recent instance logs via `logs.keep_instances`
+- Switch workspaces and manage grouped process lifecycle (`wsx <workspace>`, `wsx up`, `wsx down`)
+- Run commands in current workspace context (`wsx exec <cmd...>`)
+- Layer environment resolution: OS -> dotenv -> envrc
+- Inspect and follow logs by process/stream with detach support (`wsx logs`, `--no-follow`, `q` + Enter)
+- Keep runtime state outside repositories (`~/.config/wsx`) with per-workspace instance retention
 
 ## Installation
 
@@ -43,28 +40,9 @@ cargo run -- <args>
 
 ## Usage
 
-```sh
-# Switch to workspace "deva"
-wsx deva
+Detailed command usage is documented in:
 
-# List configured workspaces
-wsx list
-
-# Show default log target
-wsx logs
-
-# Show combined logs for backend
-wsx logs backend
-
-# Show stderr only
-wsx logs backend:err
-
-# Show current workspace/process status
-wsx status
-
-# Stop current workspace
-wsx down
-```
+- `docs/USAGE.md`
 
 ## Configuration
 
