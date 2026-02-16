@@ -2,9 +2,11 @@
 mod linux_e2e {
     use serde::Deserialize;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     struct TempDirGuard {
         path: PathBuf,
@@ -71,10 +73,17 @@ mod linux_e2e {
         }
 
         fn run(&self, args: &[&str]) -> Output {
+            self.run_with_env(args, &[])
+        }
+
+        fn run_with_env(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_wsx"));
             cmd.args(args)
                 .env("HOME", &self.home_dir)
                 .env_remove("WSX_HOME");
+            for (key, value) in extra_env {
+                cmd.env(key, value);
+            }
             cmd.output().expect("failed to execute wsx")
         }
 
@@ -169,6 +178,21 @@ mod linux_e2e {
         let raw = fs::read_to_string(current_path).expect("failed to read current.json");
         let current: CurrentMeta = serde_json::from_str(&raw).expect("invalid current.json");
         Some(current.instance_id)
+    }
+
+    fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        condition()
+    }
+
+    fn pid_exists(pid: u32) -> bool {
+        Path::new("/proc").join(pid.to_string()).exists()
     }
 
     #[test]
@@ -490,6 +514,121 @@ workspaces:
         assert!(
             beta_instances.iter().any(|id| id == &current_instance_id),
             "current instance should be beta's latest instance"
+        );
+    }
+
+    #[test]
+    fn envrc_uses_non_login_shell() {
+        let env = TestEnv::new("envrc-non-login-shell");
+        let demo = env.create_workspace("demo");
+
+        let fake_bin = env.home_dir.join("fake-bin");
+        fs::create_dir_all(&fake_bin).expect("failed to create fake bin");
+
+        let sh_shim = fake_bin.join("sh");
+        fs::write(
+            &sh_shim,
+            r#"#!/bin/sh
+if [ -n "${WSX_SH_ARG_FILE:-}" ]; then
+  printf '%s' "$1" > "$WSX_SH_ARG_FILE"
+fi
+exec /bin/sh "$@"
+"#,
+        )
+        .expect("failed to write sh shim");
+        fs::set_permissions(&sh_shim, fs::Permissions::from_mode(0o755))
+            .expect("failed to chmod sh shim");
+
+        fs::write(demo.join(".envrc"), "export WSX_ENVRC_MARKER=loaded\n")
+            .expect("failed to write .envrc");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: true
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: envdump
+        cmd: ["env"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let sh_arg_file = env.home_dir.join("sh-arg.txt");
+        let host_path = std::env::var("PATH").expect("PATH should be set in test env");
+        let merged_path = format!("{}:{host_path}", fake_bin.display());
+        let sh_arg_path = sh_arg_file.to_string_lossy().to_string();
+
+        let switch = env.run_with_env(
+            &["demo"],
+            &[
+                ("PATH", merged_path.as_str()),
+                ("WSX_SH_ARG_FILE", sh_arg_path.as_str()),
+            ],
+        );
+        assert_success(&switch);
+        let switch_stdout = stdout(&switch);
+        assert!(
+            switch_stdout.contains("WSX_ENVRC_MARKER=loaded"),
+            "envrc output should be applied to child process environment"
+        );
+
+        let recorded_flag =
+            fs::read_to_string(&sh_arg_file).expect("sh shim should record the first arg");
+        assert_eq!(
+            recorded_flag, "-c",
+            ".envrc shell must run as non-login shell"
+        );
+    }
+
+    #[test]
+    fn down_kills_background_child_processes() {
+        let env = TestEnv::new("down-kills-child-processes");
+        let demo = env.create_workspace("demo");
+        let child_pid_path = demo.join("child.pid");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: launcher
+        cmd: ["sh", "-c", "sleep 60 & echo $! > child.pid"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        assert!(
+            wait_until(Duration::from_secs(2), || child_pid_path.exists()),
+            "child pid file was not created"
+        );
+        let child_pid: u32 = fs::read_to_string(&child_pid_path)
+            .expect("failed to read child pid file")
+            .trim()
+            .parse()
+            .expect("child pid must be numeric");
+        assert!(
+            pid_exists(child_pid),
+            "background child process should be running before down"
+        );
+
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        assert!(
+            wait_until(Duration::from_secs(3), || !pid_exists(child_pid)),
+            "background child process should be terminated by down"
         );
     }
 
