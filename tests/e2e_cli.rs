@@ -646,7 +646,7 @@ workspaces:
     path: {}
     processes:
       - name: envdump
-        cmd: ["env"]
+        cmd: ["sh", "-c", "echo \"$WSX_ENVRC_MARKER\""]
 "#,
             yaml_path(&demo),
         ));
@@ -666,7 +666,7 @@ workspaces:
         assert_success(&switch);
         let switch_stdout = stdout(&switch);
         assert!(
-            switch_stdout.contains("WSX_ENVRC_MARKER=loaded"),
+            switch_stdout.lines().any(|line| line.trim() == "loaded"),
             "envrc output should be applied to child process environment"
         );
 
