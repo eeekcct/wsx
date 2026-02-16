@@ -131,6 +131,7 @@ mod linux_e2e {
     #[derive(Debug, Deserialize)]
     struct CurrentMeta {
         instance_id: String,
+        status: Option<String>,
     }
 
     fn workspace_instance_ids(env: &TestEnv, workspace_name: &str) -> Vec<String> {
@@ -178,6 +179,17 @@ mod linux_e2e {
         let raw = fs::read_to_string(current_path).expect("failed to read current.json");
         let current: CurrentMeta = serde_json::from_str(&raw).expect("invalid current.json");
         Some(current.instance_id)
+    }
+
+    fn current_meta(env: &TestEnv) -> Option<CurrentMeta> {
+        let current_path = env.wsx_home().join("current.json");
+        if !current_path.exists() {
+            return None;
+        }
+
+        let raw = fs::read_to_string(current_path).expect("failed to read current.json");
+        let current: CurrentMeta = serde_json::from_str(&raw).expect("invalid current.json");
+        Some(current)
     }
 
     fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
@@ -282,7 +294,56 @@ workspaces:
 
         let status_after_down = env.run(&["status"]);
         assert_success(&status_after_down);
-        assert!(stdout(&status_after_down).contains("Current: none"));
+        let status_after_down_stdout = stdout(&status_after_down);
+        assert!(status_after_down_stdout.contains("Current workspace: deva"));
+        assert!(status_after_down_stdout.contains("State: stopped"));
+    }
+
+    #[test]
+    fn down_and_up_restart_current_workspace() {
+        let env = TestEnv::new("down-up");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo demo-run; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let first_switch = env.run(&["demo"]);
+        assert_success(&first_switch);
+        let first_instance =
+            current_instance_id(&env).expect("current instance should exist after first switch");
+
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        let down_stdout = stdout(&down);
+        assert!(down_stdout.contains("stopped workspace `demo`"));
+
+        let meta_after_down = current_meta(&env).expect("current should be preserved after down");
+        assert_eq!(meta_after_down.status.as_deref(), Some("stopped"));
+
+        let up = env.run(&["up"]);
+        assert_success(&up);
+        assert!(stdout(&up).contains("started workspace `demo`"));
+
+        let meta_after_up = current_meta(&env).expect("current should exist after up");
+        assert_eq!(meta_after_up.status.as_deref(), Some("running"));
+        assert_ne!(
+            meta_after_up.instance_id, first_instance,
+            "up should create a new instance id"
+        );
     }
 
     #[test]
@@ -323,6 +384,39 @@ workspaces:
         let logs_err = env.run(&["logs", "backend:err"]);
         assert_success(&logs_err);
         assert!(stdout(&logs_err).contains("backend-err"));
+    }
+
+    #[test]
+    fn logs_no_follow_returns_immediately() {
+        let env = TestEnv::new("logs-no-follow");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: backend
+        default_log: true
+        cmd: ["sh", "-lc", "echo backend-out; sleep 2"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let started_at = Instant::now();
+        let logs = env.run(&["logs", "--no-follow"]);
+        assert_success(&logs);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(1),
+            "logs --no-follow should return without waiting for process exit"
+        );
     }
 
     #[test]
@@ -630,6 +724,44 @@ workspaces:
             wait_until(Duration::from_secs(3), || !pid_exists(child_pid)),
             "background child process should be terminated by down"
         );
+    }
+
+    #[test]
+    fn exec_runs_command_in_current_workspace() {
+        let env = TestEnv::new("exec");
+        let demo = env.create_workspace("demo");
+        let marker = demo.join("exec-result.txt");
+
+        fs::write(demo.join(".env"), "WSX_EXEC_MARK=from-dotenv\n").expect("failed to write .env");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo boot; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let exec = env.run(&[
+            "exec",
+            "sh",
+            "-c",
+            "printf '%s' \"$WSX_EXEC_MARK\" > exec-result.txt",
+        ]);
+        assert_success(&exec);
+
+        let marker_content = fs::read_to_string(marker).expect("exec marker should be created");
+        assert_eq!(marker_content, "from-dotenv");
     }
 
     #[test]

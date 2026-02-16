@@ -5,11 +5,33 @@ use std::fs;
 
 use crate::paths;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CurrentStatus {
+    Running,
+    Stopped,
+}
+
+impl CurrentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+fn default_current_status() -> CurrentStatus {
+    CurrentStatus::Running
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentState {
     pub workspace: String,
     pub instance_id: String,
     pub started_at: DateTime<Utc>,
+    #[serde(default = "default_current_status")]
+    pub status: CurrentStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,5 +126,13 @@ mod tests {
         let raw = serde_json::to_string(&file).expect("serialize");
         let decoded: PidsFile = serde_json::from_str(&raw).expect("deserialize");
         assert_eq!(decoded.entries[0].name, "backend");
+    }
+
+    #[test]
+    fn current_status_defaults_to_running_for_legacy_json() {
+        let raw =
+            r#"{"workspace":"deva","instance_id":"inst","started_at":"2025-01-01T00:00:00Z"}"#;
+        let current: CurrentState = serde_json::from_str(raw).expect("deserialize current");
+        assert_eq!(current.status, CurrentStatus::Running);
     }
 }

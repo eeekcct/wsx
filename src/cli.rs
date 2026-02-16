@@ -38,6 +38,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     List,
+    Up,
     Down,
     Logs {
         #[arg(value_name = "target")]
@@ -45,6 +46,13 @@ pub enum Command {
 
         #[arg(long)]
         lines: Option<usize>,
+
+        #[arg(long = "no-follow", default_value_t = false)]
+        no_follow: bool,
+    },
+    Exec {
+        #[arg(value_name = "cmd", num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
     },
     Status,
 }

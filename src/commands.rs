@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -11,14 +12,23 @@ use crate::env;
 use crate::logs;
 use crate::paths;
 use crate::process;
-use crate::state::{self, CurrentState};
+use crate::state::{self, CurrentState, CurrentStatus};
 
 pub fn run(cli: Cli) -> Result<()> {
     match (cli.workspace, cli.command) {
         (Some(workspace), None) => switch_workspace(&workspace),
         (None, Some(Command::List)) => list_workspaces(),
+        (None, Some(Command::Up)) => up_current(),
         (None, Some(Command::Down)) => down_current(None),
-        (None, Some(Command::Logs { target, lines })) => logs_current(target, lines),
+        (
+            None,
+            Some(Command::Logs {
+                target,
+                lines,
+                no_follow,
+            }),
+        ) => logs_current(target, lines, !no_follow),
+        (None, Some(Command::Exec { cmd })) => exec_current(cmd),
         (None, Some(Command::Status)) => status_current(),
         (None, None) => bail!("workspace or subcommand is required"),
         (Some(_), Some(_)) => bail!("workspace argument and subcommand cannot be used together"),
@@ -33,25 +43,45 @@ fn switch_workspace(workspace_name: &str) -> Result<()> {
 
     down_current(Some(&config))?;
 
-    let env_map = env::build_environment(&workspace)?;
+    start_workspace_instance(&workspace, "switched to")
+}
+
+fn up_current() -> Result<()> {
+    paths::ensure_home_layout()?;
+    let current = state::load_current()?.context("no current workspace")?;
+
+    if current.status == CurrentStatus::Running {
+        println!("workspace `{}` is already running", current.workspace);
+        return Ok(());
+    }
+
+    let config = Config::load()?;
+    let workspace = config.resolve_workspace(&current.workspace)?;
+    start_workspace_instance(&workspace, "started")
+}
+
+fn start_workspace_instance(workspace: &ResolvedWorkspace, action: &str) -> Result<()> {
+    let env_map = env::build_environment(workspace)?;
     let instance_id = Uuid::new_v4().to_string();
 
-    let pids = process::start_workspace(&workspace, &instance_id, &env_map)?;
+    let pids = process::start_workspace(workspace, &instance_id, &env_map)?;
 
     state::save_pids(&pids)?;
     state::save_current(&CurrentState {
         workspace: workspace.name.clone(),
         instance_id,
         started_at: Utc::now(),
+        status: CurrentStatus::Running,
     })?;
 
-    println!("switched to workspace `{}`", workspace.name);
+    println!("{action} workspace `{}`", workspace.name);
     logs::show_logs(&pids, &workspace.logs_default, workspace.logs_lines, true)?;
     cleanup_workspace_instances(
         &workspace.name,
         workspace.logs_keep_instances,
         Some(&pids.instance_id),
     )?;
+
     Ok(())
 }
 
@@ -85,36 +115,41 @@ fn down_current(config: Option<&Config>) -> Result<()> {
         }
     };
 
-    let Some(current) = current else {
-        println!("no running workspace");
+    let Some(mut current) = current else {
+        println!("no current workspace");
         return Ok(());
     };
 
-    let pids_file = match state::load_pids(&current.instance_id) {
-        Ok(pids) => pids,
-        Err(err) => {
-            eprintln!(
-                "warning: pids file for instance `{}` could not be read: {err:#}",
-                current.instance_id
-            );
-            state::clear_current()?;
-            return Ok(());
-        }
-    };
+    if current.status == CurrentStatus::Stopped {
+        println!("workspace `{}` is already stopped", current.workspace);
+        return Ok(());
+    }
+
+    let pids_file = state::load_pids(&current.instance_id).with_context(|| {
+        format!(
+            "pids file for instance `{}` could not be read",
+            current.instance_id
+        )
+    })?;
 
     let grace_seconds = resolve_grace_seconds(config, &current.workspace);
     process::stop_workspace(&pids_file, grace_seconds)?;
-    state::clear_current()?;
+    current.status = CurrentStatus::Stopped;
+    state::save_current(&current)?;
     let keep_instances = resolve_keep_instances(config, &current.workspace);
-    cleanup_workspace_instances(&current.workspace, keep_instances, None)?;
+    cleanup_workspace_instances(
+        &current.workspace,
+        keep_instances,
+        Some(&current.instance_id),
+    )?;
 
     println!("stopped workspace `{}`", current.workspace);
 
     Ok(())
 }
 
-fn logs_current(target: Option<String>, lines: Option<usize>) -> Result<()> {
-    let current = state::load_current()?.context("no running workspace")?;
+fn logs_current(target: Option<String>, lines: Option<usize>, follow: bool) -> Result<()> {
+    let current = state::load_current()?.context("no current workspace")?;
     let pids = state::load_pids(&current.instance_id)?;
 
     let (default_target, default_lines) = resolve_log_defaults(&current.workspace, &pids);
@@ -122,29 +157,53 @@ fn logs_current(target: Option<String>, lines: Option<usize>) -> Result<()> {
     let resolved_target = target.unwrap_or(default_target);
     let resolved_lines = lines.unwrap_or(default_lines);
 
-    logs::show_logs(&pids, &resolved_target, resolved_lines, true)?;
+    logs::show_logs(&pids, &resolved_target, resolved_lines, follow)?;
     Ok(())
 }
 
-fn status_current() -> Result<()> {
-    let current = match state::load_current() {
-        Ok(value) => value,
-        Err(err) => {
-            println!("Current: invalid ({err:#})");
-            return Ok(());
-        }
-    };
+fn exec_current(cmd: Vec<String>) -> Result<()> {
+    let current = state::load_current()?.context("no current workspace")?;
+    if current.status == CurrentStatus::Stopped {
+        bail!(
+            "current workspace `{}` is stopped; run `wsx up` first",
+            current.workspace
+        );
+    }
 
-    let Some(current) = current else {
-        println!("Current: none");
-        return Ok(());
-    };
+    let config = Config::load()?;
+    let workspace = config.resolve_workspace(&current.workspace)?;
+    let env_map = env::build_environment(&workspace)?;
 
+    let mut command = ProcessCommand::new(&cmd[0]);
+    command
+        .args(&cmd[1..])
+        .current_dir(&workspace.path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env_clear()
+        .envs(env_map.iter());
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to execute command {:?}", cmd))?;
+
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(code) => std::process::exit(code),
+        None => bail!("command was terminated by signal"),
+    }
+}
+
+fn print_current_overview(current: &CurrentState) {
     println!("Current workspace: {}", current.workspace);
+    println!("State: {}", current.status.as_str());
     println!("Instance ID: {}", current.instance_id);
     println!("Started at: {}", current.started_at);
+}
 
-    let pids = match state::load_pids(&current.instance_id) {
+fn print_process_overview(instance_id: &str) -> Result<()> {
+    let pids = match state::load_pids(instance_id) {
         Ok(value) => value,
         Err(err) => {
             println!("Processes: unavailable ({err:#})");
@@ -163,6 +222,24 @@ fn status_current() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn status_current() -> Result<()> {
+    let current = match state::load_current() {
+        Ok(value) => value,
+        Err(err) => {
+            println!("Current: invalid ({err:#})");
+            return Ok(());
+        }
+    };
+
+    let Some(current) = current else {
+        println!("Current: none");
+        return Ok(());
+    };
+
+    print_current_overview(&current);
+    print_process_overview(&current.instance_id)
 }
 
 fn resolve_grace_seconds(config: Option<&Config>, workspace_name: &str) -> u64 {
