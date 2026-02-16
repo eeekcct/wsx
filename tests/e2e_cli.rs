@@ -347,6 +347,87 @@ workspaces:
     }
 
     #[test]
+    fn status_reconciles_current_state_when_processes_already_stopped() {
+        let env = TestEnv::new("status-reconcile");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo demo-run; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let before_status = current_meta(&env).expect("current should exist after switch");
+        assert_eq!(
+            before_status.status.as_deref(),
+            Some("running"),
+            "legacy/current behavior stores running after switch"
+        );
+
+        let status = env.run(&["status"]);
+        assert_success(&status);
+        assert!(stdout(&status).contains("State: stopped"));
+
+        let after_status = current_meta(&env).expect("current should exist after status");
+        assert_eq!(
+            after_status.status.as_deref(),
+            Some("stopped"),
+            "status should reconcile current state to stopped"
+        );
+    }
+
+    #[test]
+    fn up_restarts_when_current_processes_already_stopped() {
+        let env = TestEnv::new("up-restarts-stale-running");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo demo-run; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let first_switch = env.run(&["demo"]);
+        assert_success(&first_switch);
+        let first_instance =
+            current_instance_id(&env).expect("current instance should exist after first switch");
+
+        let up = env.run(&["up"]);
+        assert_success(&up);
+        assert!(
+            stdout(&up).contains("started workspace `demo`"),
+            "up should restart after reconciling stale running state"
+        );
+
+        let meta_after_up = current_meta(&env).expect("current should exist after up");
+        assert_ne!(
+            meta_after_up.instance_id, first_instance,
+            "up should create a new instance id when previous processes are stopped"
+        );
+    }
+
+    #[test]
     fn logs_default_and_explicit_stream_work() {
         let env = TestEnv::new("logs");
         let demo = env.create_workspace("demo");

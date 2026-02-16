@@ -48,7 +48,7 @@ fn switch_workspace(workspace_name: &str) -> Result<()> {
 
 fn up_current() -> Result<()> {
     paths::ensure_home_layout()?;
-    let current = state::load_current()?.context("no current workspace")?;
+    let current = load_current_reconciled()?.context("no current workspace")?;
 
     if current.status == CurrentStatus::Running {
         println!("workspace `{}` is already running", current.workspace);
@@ -149,7 +149,7 @@ fn down_current(config: Option<&Config>) -> Result<()> {
 }
 
 fn logs_current(target: Option<String>, lines: Option<usize>, follow: bool) -> Result<()> {
-    let current = state::load_current()?.context("no current workspace")?;
+    let current = load_current_reconciled()?.context("no current workspace")?;
     let pids = state::load_pids(&current.instance_id)?;
 
     let (default_target, default_lines) = resolve_log_defaults(&current.workspace, &pids);
@@ -162,7 +162,7 @@ fn logs_current(target: Option<String>, lines: Option<usize>, follow: bool) -> R
 }
 
 fn exec_current(cmd: Vec<String>) -> Result<()> {
-    let current = state::load_current()?.context("no current workspace")?;
+    let current = load_current_reconciled()?.context("no current workspace")?;
     if current.status == CurrentStatus::Stopped {
         bail!(
             "current workspace `{}` is stopped; run `wsx up` first",
@@ -225,7 +225,7 @@ fn print_process_overview(instance_id: &str) -> Result<()> {
 }
 
 fn status_current() -> Result<()> {
-    let current = match state::load_current() {
+    let current = match load_current_reconciled() {
         Ok(value) => value,
         Err(err) => {
             println!("Current: invalid ({err:#})");
@@ -240,6 +240,29 @@ fn status_current() -> Result<()> {
 
     print_current_overview(&current);
     print_process_overview(&current.instance_id)
+}
+
+fn load_current_reconciled() -> Result<Option<CurrentState>> {
+    let Some(mut current) = state::load_current()? else {
+        return Ok(None);
+    };
+
+    if current.status != CurrentStatus::Running {
+        return Ok(Some(current));
+    }
+
+    let pids = match state::load_pids(&current.instance_id) {
+        Ok(pids) => pids,
+        Err(_) => return Ok(Some(current)),
+    };
+
+    let has_running_pid = pids.entries.iter().any(|entry| process::is_pid_running(entry.pid));
+    if !has_running_pid {
+        current.status = CurrentStatus::Stopped;
+        state::save_current(&current)?;
+    }
+
+    Ok(Some(current))
 }
 
 fn resolve_grace_seconds(config: Option<&Config>, workspace_name: &str) -> u64 {
