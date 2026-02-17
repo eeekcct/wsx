@@ -15,7 +15,7 @@ serde_yaml = "0.9.34"
 sysinfo = "0.38.0"
 thiserror = "2.0.11"
 uuid = { version = "1.12.1", features = ["v4", "serde"] }
-signal-hook = "0.3.17"
+signal-hook = "0.4.0"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.0", features = ["signal", "term"] }
