@@ -2,3 +2,4 @@
 /dist
 third_party_licenses
 tmp
+.zig-cache
