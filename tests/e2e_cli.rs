@@ -1,10 +1,16 @@
 #[cfg(target_os = "linux")]
 mod linux_e2e {
+    use nix::pty::openpty;
+    use nix::sys::signal::{Signal, kill};
+    use nix::sys::termios::{Termios, tcgetattr};
+    use nix::unistd::Pid;
     use serde::Deserialize;
-    use std::fs;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::os::fd::AsFd;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::{Child, Command, ExitStatus, Output, Stdio};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -77,6 +83,16 @@ mod linux_e2e {
         }
 
         fn run_with_env(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+            self.build_command(args, extra_env)
+                .output()
+                .expect("failed to execute wsx")
+        }
+
+        fn spawn_with_pty(&self, args: &[&str], extra_env: &[(&str, &str)]) -> PtySession {
+            PtySession::spawn(self, args, extra_env)
+        }
+
+        fn build_command(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Command {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_wsx"));
             cmd.args(args)
                 .env("HOME", &self.home_dir)
@@ -84,11 +100,103 @@ mod linux_e2e {
             for (key, value) in extra_env {
                 cmd.env(key, value);
             }
-            cmd.output().expect("failed to execute wsx")
+            cmd
         }
 
         fn wsx_home(&self) -> PathBuf {
             self.home_dir.join(".config").join("wsx")
+        }
+    }
+
+    struct PtySession {
+        child: Child,
+        master: File,
+        initial_termios: Termios,
+    }
+
+    impl PtySession {
+        fn spawn(env: &TestEnv, args: &[&str], extra_env: &[(&str, &str)]) -> Self {
+            let pty = openpty(None, None).expect("failed to create pty");
+            let initial_termios = tcgetattr(&pty.master).expect("failed to read initial termios");
+
+            let master = File::from(pty.master);
+            let slave = File::from(pty.slave);
+            let slave_in = slave
+                .try_clone()
+                .expect("failed to clone pty slave for stdin");
+            let slave_out = slave
+                .try_clone()
+                .expect("failed to clone pty slave for stdout");
+
+            let mut cmd = env.build_command(args, extra_env);
+            cmd.stdin(Stdio::from(slave_in))
+                .stdout(Stdio::from(slave_out))
+                .stderr(Stdio::from(slave));
+
+            let child = cmd.spawn().expect("failed to spawn wsx with pty");
+
+            Self {
+                child,
+                master,
+                initial_termios,
+            }
+        }
+
+        fn write_bytes(&mut self, bytes: &[u8]) {
+            self.master
+                .write_all(bytes)
+                .expect("failed to write to pty");
+            self.master.flush().expect("failed to flush pty write");
+        }
+
+        fn wait_for_exit(&mut self, timeout: Duration) -> ExitStatus {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(status) = self.child.try_wait().expect("failed to poll wsx process") {
+                    return status;
+                }
+
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for wsx process to exit"
+                );
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        fn send_sigint(&self) {
+            let raw_pid = i32::try_from(self.child.id()).expect("child pid should fit i32");
+            kill(Pid::from_raw(raw_pid), Signal::SIGINT).expect("failed to send SIGINT to wsx");
+        }
+
+        fn assert_terminal_restored(&self) {
+            let current = tcgetattr(self.master.as_fd()).expect("failed to read current termios");
+            assert_eq!(
+                current.input_flags, self.initial_termios.input_flags,
+                "input flags should be restored after wsx exits"
+            );
+            assert_eq!(
+                current.output_flags, self.initial_termios.output_flags,
+                "output flags should be restored after wsx exits"
+            );
+            assert_eq!(
+                current.local_flags, self.initial_termios.local_flags,
+                "local flags should be restored after wsx exits"
+            );
+        }
+    }
+
+    impl Drop for PtySession {
+        fn drop(&mut self) {
+            if self
+                .child
+                .try_wait()
+                .expect("failed to poll wsx process")
+                .is_none()
+            {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
         }
     }
 
@@ -159,6 +267,13 @@ mod linux_e2e {
     #[derive(Debug, Deserialize)]
     struct PidsMeta {
         workspace: String,
+        entries: Vec<PidEntryMeta>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PidEntryMeta {
+        name: String,
+        pid: u32,
     }
 
     #[derive(Debug, Deserialize)]
@@ -223,6 +338,31 @@ mod linux_e2e {
         let raw = fs::read_to_string(current_path).expect("failed to read current.json");
         let current: CurrentMeta = serde_json::from_str(&raw).expect("invalid current.json");
         Some(current)
+    }
+
+    fn current_process_pid(env: &TestEnv, process_name: &str) -> Option<u32> {
+        let instance_id = current_instance_id(env)?;
+        let pids_path = env
+            .wsx_home()
+            .join("instances")
+            .join(instance_id)
+            .join("pids.json");
+        if !pids_path.exists() {
+            return None;
+        }
+
+        let raw = fs::read_to_string(pids_path).expect("failed to read pids.json");
+        let meta: PidsMeta = serde_json::from_str(&raw).expect("invalid pids.json");
+        meta.entries
+            .iter()
+            .find(|entry| entry.name == process_name)
+            .map(|entry| entry.pid)
+    }
+
+    fn wait_for_current_status(env: &TestEnv, expected: &str, timeout: Duration) -> bool {
+        wait_until(timeout, || {
+            current_meta(env).is_some_and(|meta| meta.status.as_deref() == Some(expected))
+        })
     }
 
     fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
@@ -781,6 +921,186 @@ workspaces:
         let invalid_stream = env.run(&["logs", "app:foo", "--no-follow"]);
         assert_failure(&invalid_stream);
         assert_stderr_contains(&invalid_stream, "invalid logs stream `foo`");
+    }
+
+    #[test]
+    fn q_detach_restores_terminal_and_keeps_workspace_running_with_null_stdin() {
+        let env = TestEnv::new("q-detach-keeps-running");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: backend
+        default_log: true
+        cmd: ["sh", "-lc", "echo boot; sleep 60"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let mut session = env.spawn_with_pty(&["demo"], &[]);
+        assert!(
+            wait_for_current_status(&env, "running", Duration::from_secs(5)),
+            "workspace should become running while log follow is active"
+        );
+
+        let backend_pid = current_process_pid(&env, "backend")
+            .expect("backend pid should be recorded in current instance");
+        assert!(pid_exists(backend_pid), "backend should still be running");
+
+        let stdin_path = fs::read_link(format!("/proc/{backend_pid}/fd/0"))
+            .expect("failed to inspect backend stdin fd link");
+        assert_eq!(
+            stdin_path,
+            PathBuf::from("/dev/null"),
+            "managed process stdin should be disconnected from wsx terminal"
+        );
+
+        session.write_bytes(b"q\n");
+        let exit = session.wait_for_exit(Duration::from_secs(5));
+        assert_eq!(
+            exit.code(),
+            Some(0),
+            "q detach should exit wsx without stopping the workspace"
+        );
+        session.assert_terminal_restored();
+
+        assert!(
+            pid_exists(backend_pid),
+            "backend should keep running after detach"
+        );
+
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        assert_down_succeeded_message(&down, "demo");
+    }
+
+    #[test]
+    fn ctrl_c_during_workspace_follow_stops_workspace_before_exit() {
+        let env = TestEnv::new("ctrlc-workspace-follow");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: backend
+        default_log: true
+        cmd: ["sh", "-lc", "echo boot; sleep 60"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let mut session = env.spawn_with_pty(&["demo"], &[]);
+        assert!(
+            wait_for_current_status(&env, "running", Duration::from_secs(5)),
+            "workspace should become running before interrupt"
+        );
+
+        let backend_pid = current_process_pid(&env, "backend")
+            .expect("backend pid should be recorded in current instance");
+        assert!(
+            pid_exists(backend_pid),
+            "backend should be running before Ctrl+C"
+        );
+
+        session.send_sigint();
+        let exit = session.wait_for_exit(Duration::from_secs(8));
+        assert_eq!(
+            exit.code(),
+            Some(130),
+            "Ctrl+C should exit with signal-compatible code 130"
+        );
+        session.assert_terminal_restored();
+
+        assert!(
+            wait_for_current_status(&env, "stopped", Duration::from_secs(5)),
+            "Ctrl+C should stop current workspace before wsx exits"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || !pid_exists(backend_pid)),
+            "backend process should be terminated by Ctrl+C-triggered down"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_during_logs_follow_stops_workspace_before_exit() {
+        let env = TestEnv::new("ctrlc-logs-follow");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: backend
+        default_log: true
+        cmd: ["sh", "-lc", "echo boot; sleep 60"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let mut switch_session = env.spawn_with_pty(&["demo"], &[]);
+        assert!(
+            wait_for_current_status(&env, "running", Duration::from_secs(5)),
+            "workspace should be running after switch"
+        );
+
+        switch_session.write_bytes(b"q\n");
+        let switch_exit = switch_session.wait_for_exit(Duration::from_secs(5));
+        assert_eq!(switch_exit.code(), Some(0), "q detach should succeed");
+
+        let backend_pid = current_process_pid(&env, "backend")
+            .expect("backend pid should be recorded after detach");
+        assert!(
+            pid_exists(backend_pid),
+            "backend should keep running for logs test"
+        );
+
+        let mut logs_session = env.spawn_with_pty(&["logs", "backend"], &[]);
+        assert!(
+            wait_for_current_status(&env, "running", Duration::from_secs(2)),
+            "workspace should still be running when logs follow starts"
+        );
+        thread::sleep(Duration::from_millis(200));
+        logs_session.send_sigint();
+        let logs_exit = logs_session.wait_for_exit(Duration::from_secs(8));
+        assert_eq!(
+            logs_exit.code(),
+            Some(130),
+            "Ctrl+C on logs should exit with 130"
+        );
+        logs_session.assert_terminal_restored();
+
+        assert!(
+            wait_for_current_status(&env, "stopped", Duration::from_secs(5)),
+            "Ctrl+C during logs follow should stop workspace"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || !pid_exists(backend_pid)),
+            "backend process should be terminated after logs follow interrupt"
+        );
     }
 
     #[test]

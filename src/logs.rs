@@ -1,7 +1,12 @@
 use anyhow::{Context, Result, bail};
+use signal_hook::SigId;
+use signal_hook::consts::signal::SIGINT;
+use signal_hook::{flag, low_level};
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -22,7 +27,19 @@ struct ParsedTarget {
     stream: StreamKind,
 }
 
-pub fn show_logs(pids_file: &PidsFile, target: &str, lines: usize, follow: bool) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowOutcome {
+    Completed,
+    Detached,
+    Interrupted,
+}
+
+pub fn show_logs(
+    pids_file: &PidsFile,
+    target: &str,
+    lines: usize,
+    follow: bool,
+) -> Result<FollowOutcome> {
     let parsed = parse_target(target)?;
     let entry = pids_file
         .entries
@@ -37,7 +54,7 @@ pub fn show_logs(pids_file: &PidsFile, target: &str, lines: usize, follow: bool)
     }
 }
 
-fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<()> {
+fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<FollowOutcome> {
     let out = PathBuf::from(&entry.out_log);
     let err = PathBuf::from(&entry.err_log);
     let combined = PathBuf::from(&entry.combined_log);
@@ -47,17 +64,17 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<()> {
     print_last_lines(&combined, lines)?;
 
     if !follow {
-        return Ok(());
+        return Ok(FollowOutcome::Completed);
     }
 
-    let detach_rx = spawn_detach_listener();
+    let control = FollowControl::new()?;
     let mut out_pos = file_len(&out)?;
     let mut err_pos = file_len(&err)?;
     let mut combined_pos = file_len(&combined)?;
 
     loop {
-        if should_detach(&detach_rx) {
-            return Ok(());
+        if let Some(outcome) = control.poll()? {
+            return Ok(outcome);
         }
 
         let mut had_delta = false;
@@ -88,7 +105,7 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<()> {
             rebuild_combined(&out, &err, &combined)?;
             let final_delta = read_from_offset(&combined, combined_pos)?;
             if final_delta.is_empty() {
-                return Ok(());
+                return Ok(FollowOutcome::Completed);
             }
 
             print!("{}", String::from_utf8_lossy(&final_delta));
@@ -96,23 +113,23 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<()> {
             combined_pos += final_delta.len() as u64;
         }
 
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
-fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<()> {
+fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<FollowOutcome> {
     ensure_file(path)?;
     print_last_lines(path, lines)?;
 
     if !follow {
-        return Ok(());
+        return Ok(FollowOutcome::Completed);
     }
 
-    let detach_rx = spawn_detach_listener();
+    let control = FollowControl::new()?;
     let mut pos = file_len(path)?;
     loop {
-        if should_detach(&detach_rx) {
-            return Ok(());
+        if let Some(outcome) = control.poll()? {
+            return Ok(outcome);
         }
 
         let mut had_delta = false;
@@ -128,7 +145,7 @@ fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<()> {
         if !had_delta && !is_pid_running(pid) {
             let final_delta = read_from_offset(path, pos)?;
             if final_delta.is_empty() {
-                return Ok(());
+                return Ok(FollowOutcome::Completed);
             }
 
             print!("{}", String::from_utf8_lossy(&final_delta));
@@ -136,7 +153,7 @@ fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<()> {
             pos += final_delta.len() as u64;
         }
 
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -243,12 +260,65 @@ fn ensure_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+struct FollowControl {
+    signal: SignalGuard,
+    detach_rx: Option<Receiver<()>>,
+}
+
+impl FollowControl {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            signal: SignalGuard::register()?,
+            detach_rx: spawn_detach_listener(),
+        })
+    }
+
+    fn poll(&self) -> Result<Option<FollowOutcome>> {
+        if self.signal.interrupted() {
+            return Ok(Some(FollowOutcome::Interrupted));
+        }
+
+        if should_detach(&self.detach_rx) {
+            return Ok(Some(FollowOutcome::Detached));
+        }
+
+        Ok(None)
+    }
+}
+
+struct SignalGuard {
+    signal_id: SigId,
+    interrupted: Arc<AtomicBool>,
+}
+
+impl SignalGuard {
+    fn register() -> Result<Self> {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let signal_id = flag::register(SIGINT, Arc::clone(&interrupted))
+            .context("failed to register SIGINT handler")?;
+        Ok(Self {
+            signal_id,
+            interrupted,
+        })
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        low_level::unregister(self.signal_id);
+    }
+}
+
 fn spawn_detach_listener() -> Option<Receiver<()>> {
     if !std::io::stdin().is_terminal() {
         return None;
     }
 
-    eprintln!("[wsx] following logs (press q + Enter to detach)");
+    eprintln!("[wsx] following logs (press q + Enter to detach, Ctrl+C to stop workspace)");
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
