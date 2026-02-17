@@ -14,6 +14,9 @@ use std::time::Duration;
 use crate::process;
 use crate::state::{PidEntry, PidsFile};
 
+const BACKOFF_MIN_MS: u64 = 100;
+const BACKOFF_MAX_MS: u64 = 1000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StreamKind {
     Combined,
@@ -72,6 +75,8 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<FollowO
     let mut err_pos = file_len(&err)?;
     let mut combined_pos = file_len(&combined)?;
 
+    let mut sleep_backoff = BACKOFF_MIN_MS;
+
     loop {
         if let Some(outcome) = control.poll()? {
             return Ok(outcome);
@@ -113,7 +118,8 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<FollowO
             combined_pos += final_delta.len() as u64;
         }
 
-        thread::sleep(Duration::from_millis(100));
+        sleep_backoff = next_backoff_ms(sleep_backoff, had_delta);
+        thread::sleep(Duration::from_millis(sleep_backoff));
     }
 }
 
@@ -127,6 +133,7 @@ fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<Follow
 
     let control = FollowControl::new()?;
     let mut pos = file_len(path)?;
+    let mut sleep_backoff = BACKOFF_MIN_MS;
     loop {
         if let Some(outcome) = control.poll()? {
             return Ok(outcome);
@@ -153,7 +160,8 @@ fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<Follow
             pos += final_delta.len() as u64;
         }
 
-        thread::sleep(Duration::from_millis(100));
+        sleep_backoff = next_backoff_ms(sleep_backoff, had_delta);
+        thread::sleep(Duration::from_millis(sleep_backoff));
     }
 }
 
@@ -258,6 +266,16 @@ fn ensure_file(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn next_backoff_ms(current: u64, had_delta: bool) -> u64 {
+    if had_delta {
+        BACKOFF_MIN_MS
+    } else {
+        current
+            .saturating_mul(2)
+            .clamp(BACKOFF_MIN_MS, BACKOFF_MAX_MS)
+    }
 }
 
 struct FollowControl {
@@ -370,5 +388,26 @@ mod tests {
         assert_eq!(err.stream, StreamKind::Err);
 
         assert!(parse_target("backend:unknown").is_err());
+    }
+
+    #[test]
+    fn backoff_increases_until_cap() {
+        let mut ms = BACKOFF_MIN_MS;
+        ms = next_backoff_ms(ms, false);
+        assert_eq!(ms, 200);
+        ms = next_backoff_ms(ms, false);
+        assert_eq!(ms, 400);
+        ms = next_backoff_ms(ms, false);
+        assert_eq!(ms, 800);
+        ms = next_backoff_ms(ms, false);
+        assert_eq!(ms, BACKOFF_MAX_MS);
+        ms = next_backoff_ms(ms, false);
+        assert_eq!(ms, BACKOFF_MAX_MS);
+    }
+
+    #[test]
+    fn backoff_resets_on_delta() {
+        let ms = next_backoff_ms(800, true);
+        assert_eq!(ms, BACKOFF_MIN_MS);
     }
 }
