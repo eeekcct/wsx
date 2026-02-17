@@ -1,7 +1,9 @@
 #[cfg(target_os = "linux")]
 mod linux_e2e {
     use nix::pty::openpty;
+    use nix::sys::signal::{Signal, kill};
     use nix::sys::termios::{Termios, tcgetattr};
+    use nix::unistd::Pid;
     use serde::Deserialize;
     use std::fs::{self, File};
     use std::io::Write;
@@ -160,6 +162,11 @@ mod linux_e2e {
                 );
                 thread::sleep(Duration::from_millis(25));
             }
+        }
+
+        fn send_sigint(&self) {
+            let raw_pid = i32::try_from(self.child.id()).expect("child pid should fit i32");
+            kill(Pid::from_raw(raw_pid), Signal::SIGINT).expect("failed to send SIGINT to wsx");
         }
 
         fn assert_terminal_restored(&self) {
@@ -1012,7 +1019,7 @@ workspaces:
             "backend should be running before Ctrl+C"
         );
 
-        session.write_bytes(&[0x03]);
+        session.send_sigint();
         let exit = session.wait_for_exit(Duration::from_secs(8));
         assert_eq!(
             exit.code(),
@@ -1077,7 +1084,7 @@ workspaces:
             "workspace should still be running when logs follow starts"
         );
         thread::sleep(Duration::from_millis(200));
-        logs_session.write_bytes(&[0x03]);
+        logs_session.send_sigint();
         let logs_exit = logs_session.wait_for_exit(Duration::from_secs(8));
         assert_eq!(
             logs_exit.code(),
