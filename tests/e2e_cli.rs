@@ -134,6 +134,28 @@ mod linux_e2e {
         );
     }
 
+    fn assert_stdout_contains_all(output: &Output, expected: &[&str]) {
+        let out = stdout(output);
+        for item in expected {
+            assert!(
+                out.contains(item),
+                "stdout should contain `{item}`\nstdout:\n{}\nstderr:\n{}",
+                out,
+                stderr(output)
+            );
+        }
+    }
+
+    fn assert_stderr_contains(output: &Output, expected: &str) {
+        let err = stderr(output);
+        assert!(
+            err.contains(expected),
+            "stderr should contain `{expected}`\nstdout:\n{}\nstderr:\n{}",
+            stdout(output),
+            err
+        );
+    }
+
     #[derive(Debug, Deserialize)]
     struct PidsMeta {
         workspace: String,
@@ -266,6 +288,94 @@ workspaces:
     }
 
     #[test]
+    fn down_without_current_prints_no_current_workspace() {
+        let env = TestEnv::new("down-no-current");
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        assert_stdout_contains_all(&down, &["no current workspace"]);
+    }
+
+    #[test]
+    fn workspace_and_subcommand_together_fails() {
+        let env = TestEnv::new("workspace-and-subcommand");
+        let result = env.run(&["list", "demo"]);
+        assert_failure(&result);
+        assert_stderr_contains(&result, "unexpected argument");
+    }
+
+    #[test]
+    fn up_without_current_fails() {
+        let env = TestEnv::new("up-no-current");
+        let up = env.run(&["up"]);
+        assert_failure(&up);
+        assert_stderr_contains(&up, "no current workspace");
+    }
+
+    #[test]
+    fn logs_without_current_fails() {
+        let env = TestEnv::new("logs-no-current");
+        let logs = env.run(&["logs", "--no-follow"]);
+        assert_failure(&logs);
+        assert_stderr_contains(&logs, "no current workspace");
+    }
+
+    #[test]
+    fn exec_without_current_fails() {
+        let env = TestEnv::new("exec-no-current");
+        let exec = env.run(&["exec", "sh", "-c", "echo hello"]);
+        assert_failure(&exec);
+        assert_stderr_contains(&exec, "no current workspace");
+    }
+
+    #[test]
+    fn config_missing_file_returns_error() {
+        let env = TestEnv::new("config-missing");
+        let list = env.run(&["list"]);
+        assert_failure(&list);
+        assert_stderr_contains(&list, "config file not found");
+    }
+
+    #[test]
+    fn config_with_empty_workspaces_returns_error() {
+        let env = TestEnv::new("config-empty-workspaces");
+        env.write_config(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces: {}
+"#,
+        );
+
+        let list = env.run(&["list"]);
+        assert_failure(&list);
+        assert_stderr_contains(&list, "workspaces is empty");
+    }
+
+    #[test]
+    fn workspace_with_no_processes_fails() {
+        let env = TestEnv::new("workspace-no-processes");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes: []
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_failure(&switch);
+        assert_stderr_contains(&switch, "has no processes");
+    }
+
+    #[test]
     fn switch_status_and_down_happy_path() {
         let env = TestEnv::new("lifecycle");
         let deva = env.create_workspace("deva");
@@ -353,6 +463,75 @@ workspaces:
             meta_after_up.instance_id, first_instance,
             "up should create a new instance id"
         );
+    }
+
+    #[test]
+    fn switch_then_up_reports_already_running() {
+        let env = TestEnv::new("up-already-running");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: short
+        default_log: true
+        cmd: ["sh", "-lc", "echo short; sleep 1"]
+      - name: long
+        cmd: ["sh", "-lc", "sleep 60"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let up = env.run(&["up"]);
+        assert_success(&up);
+        assert_stdout_contains_all(&up, &["workspace `demo` is already running"]);
+
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        assert_down_succeeded_message(&down, "demo");
+    }
+
+    #[test]
+    fn list_marks_current_after_down() {
+        let env = TestEnv::new("list-after-down");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo boot; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        assert_down_succeeded_message(&down, "demo");
+
+        let list = env.run(&["list"]);
+        assert_success(&list);
+        assert_stdout_contains_all(&list, &["* demo"]);
     }
 
     #[test]
@@ -477,6 +656,69 @@ workspaces:
     }
 
     #[test]
+    fn logs_implicit_default_falls_back_to_first_process() {
+        let env = TestEnv::new("logs-default-first-process");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: api
+        cmd: ["sh", "-lc", "echo api-only; sleep 1"]
+      - name: worker
+        cmd: ["sh", "-lc", "echo worker-only; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let logs = env.run(&["logs", "--no-follow"]);
+        assert_success(&logs);
+        let out = stdout(&logs);
+        assert!(out.contains("api-only"));
+        assert!(!out.contains("worker-only"));
+    }
+
+    #[test]
+    fn logs_lines_limits_initial_tail() {
+        let env = TestEnv::new("logs-lines");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo L1; echo L2; echo L3; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let logs = env.run(&["logs", "app", "--lines", "2", "--no-follow"]);
+        assert_success(&logs);
+        let out = stdout(&logs);
+        assert!(out.contains("L2"));
+        assert!(out.contains("L3"));
+        assert!(!out.contains("L1"));
+    }
+
+    #[test]
     fn logs_no_follow_returns_immediately() {
         let env = TestEnv::new("logs-no-follow");
         let demo = env.create_workspace("demo");
@@ -507,6 +749,38 @@ workspaces:
             started_at.elapsed() < Duration::from_secs(1),
             "logs --no-follow should return without waiting for process exit"
         );
+    }
+
+    #[test]
+    fn logs_invalid_target_fails() {
+        let env = TestEnv::new("logs-invalid-target");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo app; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let unknown = env.run(&["logs", "worker", "--no-follow"]);
+        assert_failure(&unknown);
+        assert_stderr_contains(&unknown, "process `worker` is not running");
+
+        let invalid_stream = env.run(&["logs", "app:foo", "--no-follow"]);
+        assert_failure(&invalid_stream);
+        assert_stderr_contains(&invalid_stream, "invalid logs stream `foo`");
     }
 
     #[test]
@@ -769,6 +1043,118 @@ workspaces:
     }
 
     #[test]
+    fn dotenv_overrides_os_env() {
+        let env = TestEnv::new("dotenv-overrides-os");
+        let demo = env.create_workspace("demo");
+
+        fs::write(demo.join(".env"), "WSX_PRIORITY=from-dotenv\n").expect("failed to write .env");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: envdump
+        cmd: ["sh", "-c", "echo \"$WSX_PRIORITY\""]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run_with_env(&["demo"], &[("WSX_PRIORITY", "from-os")]);
+        assert_success(&switch);
+        assert_stdout_contains_all(&switch, &["from-dotenv"]);
+    }
+
+    #[test]
+    fn envrc_overrides_dotenv() {
+        let env = TestEnv::new("envrc-overrides-dotenv");
+        let demo = env.create_workspace("demo");
+
+        fs::write(demo.join(".env"), "WSX_PRIORITY=from-dotenv\n").expect("failed to write .env");
+        fs::write(demo.join(".envrc"), "export WSX_PRIORITY=from-envrc\n")
+            .expect("failed to write .envrc");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: true
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: envdump
+        cmd: ["sh", "-c", "echo \"$WSX_PRIORITY\""]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+        assert_stdout_contains_all(&switch, &["from-envrc"]);
+    }
+
+    #[test]
+    fn envrc_missing_is_noop() {
+        let env = TestEnv::new("envrc-missing");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: true
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-c", "echo no-envrc-ok"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+        assert_stdout_contains_all(&switch, &["no-envrc-ok"]);
+    }
+
+    #[test]
+    fn envrc_failure_aborts_start() {
+        let env = TestEnv::new("envrc-failure");
+        let demo = env.create_workspace("demo");
+
+        fs::write(demo.join(".envrc"), "exit 7\n").expect("failed to write .envrc");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: true
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-c", "echo should-not-run"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_failure(&switch);
+        assert_stderr_contains(&switch, ".envrc execution failed");
+        assert!(
+            current_instance_id(&env).is_none(),
+            "current should not be saved when envrc evaluation fails"
+        );
+    }
+
+    #[test]
     fn down_kills_background_child_processes() {
         let env = TestEnv::new("down-kills-child-processes");
         let demo = env.create_workspace("demo");
@@ -817,6 +1203,64 @@ workspaces:
     }
 
     #[test]
+    fn switch_stops_previous_workspace_processes() {
+        let env = TestEnv::new("switch-stops-previous");
+        let alpha = env.create_workspace("alpha");
+        let beta = env.create_workspace("beta");
+        let alpha_child_pid_path = alpha.join("child.pid");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  alpha:
+    path: {}
+    processes:
+      - name: short
+        default_log: true
+        cmd: ["sh", "-lc", "echo alpha-short; sleep 1"]
+      - name: launcher
+        cmd: ["sh", "-c", "sleep 60 & echo $! > child.pid; sleep 60"]
+  beta:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo beta; sleep 1"]
+"#,
+            yaml_path(&alpha),
+            yaml_path(&beta),
+        ));
+
+        let switch_alpha = env.run(&["alpha"]);
+        assert_success(&switch_alpha);
+        assert!(
+            wait_until(Duration::from_secs(2), || alpha_child_pid_path.exists()),
+            "alpha child pid file should be created before switching"
+        );
+
+        let child_pid: u32 = fs::read_to_string(&alpha_child_pid_path)
+            .expect("failed to read alpha child pid")
+            .trim()
+            .parse()
+            .expect("alpha child pid must be numeric");
+        assert!(
+            pid_exists(child_pid),
+            "alpha child process should be running before switching to beta"
+        );
+
+        let switch_beta = env.run(&["beta"]);
+        assert_success(&switch_beta);
+        assert!(
+            wait_until(Duration::from_secs(3), || !pid_exists(child_pid)),
+            "switch should stop previous workspace background child process"
+        );
+    }
+
+    #[test]
     fn exec_runs_command_in_current_workspace() {
         let env = TestEnv::new("exec");
         let demo = env.create_workspace("demo");
@@ -852,6 +1296,73 @@ workspaces:
 
         let marker_content = fs::read_to_string(marker).expect("exec marker should be created");
         assert_eq!(marker_content, "from-dotenv");
+    }
+
+    #[test]
+    fn exec_runs_in_workspace_cwd() {
+        let env = TestEnv::new("exec-cwd");
+        let demo = env.create_workspace("demo");
+        let cwd_marker = demo.join("cwd.txt");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo boot; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let exec = env.run(&["exec", "sh", "-c", "pwd > cwd.txt"]);
+        assert_success(&exec);
+
+        let cwd = fs::read_to_string(cwd_marker).expect("cwd marker should be created");
+        assert_eq!(cwd.trim(), demo.to_string_lossy());
+    }
+
+    #[test]
+    fn exec_works_when_current_is_stopped() {
+        let env = TestEnv::new("exec-while-stopped");
+        let demo = env.create_workspace("demo");
+        let marker = demo.join("exec-stopped.txt");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo boot; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let status = env.run(&["status"]);
+        assert_success(&status);
+        assert_stdout_contains_all(&status, &["State: stopped"]);
+
+        let exec = env.run(&["exec", "sh", "-c", "echo ok > exec-stopped.txt"]);
+        assert_success(&exec);
+
+        let marker_content =
+            fs::read_to_string(marker).expect("exec marker for stopped current should exist");
+        assert_eq!(marker_content.trim(), "ok");
     }
 
     #[test]
