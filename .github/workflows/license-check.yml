@@ -1,0 +1,21 @@
+name: License Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  license:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Run cargo-deny license check
+        run: |
+          set -euo pipefail
+          rustup default stable
+          cargo install cargo-deny --locked
+          cargo deny --manifest-path Cargo.toml check --config deny.toml licenses

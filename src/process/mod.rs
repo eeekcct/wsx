@@ -57,6 +57,7 @@ pub fn start_workspace(
         command
             .args(&process.cmd[1..])
             .current_dir(&workspace.path)
+            .stdin(Stdio::null())
             .stdout(Stdio::from(out_file))
             .stderr(Stdio::from(err_file))
             .env_clear()

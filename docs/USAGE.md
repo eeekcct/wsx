@@ -60,6 +60,7 @@ Show logs for current workspace.
 - `--no-follow` prints initial tail and exits immediately.
 - Without `--no-follow`, logs are followed:
   - press `q` then Enter to detach
+  - press `Ctrl+C` to stop the current workspace before exiting
   - follow ends automatically when target process stops and no new log is appended
 
 ### `wsx exec <cmd...>`

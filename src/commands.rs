@@ -75,7 +75,9 @@ fn start_workspace_instance(workspace: &ResolvedWorkspace, action: &str) -> Resu
     })?;
 
     println!("{action} workspace `{}`", workspace.name);
-    logs::show_logs(&pids, &workspace.logs_default, workspace.logs_lines, true)?;
+    let follow_outcome =
+        logs::show_logs(&pids, &workspace.logs_default, workspace.logs_lines, true)?;
+    handle_follow_outcome(follow_outcome)?;
     cleanup_workspace_instances(
         &workspace.name,
         workspace.logs_keep_instances,
@@ -157,8 +159,20 @@ fn logs_current(target: Option<String>, lines: Option<usize>, follow: bool) -> R
     let resolved_target = target.unwrap_or(default_target);
     let resolved_lines = lines.unwrap_or(default_lines);
 
-    logs::show_logs(&pids, &resolved_target, resolved_lines, follow)?;
+    let follow_outcome = logs::show_logs(&pids, &resolved_target, resolved_lines, follow)?;
+    if follow {
+        handle_follow_outcome(follow_outcome)?;
+    }
     Ok(())
+}
+
+fn handle_follow_outcome(outcome: logs::FollowOutcome) -> Result<()> {
+    if outcome != logs::FollowOutcome::Interrupted {
+        return Ok(());
+    }
+
+    down_current(None).context("failed to stop workspace after Ctrl+C")?;
+    std::process::exit(130);
 }
 
 fn exec_current(cmd: Vec<String>) -> Result<()> {
