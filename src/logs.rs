@@ -422,7 +422,7 @@ fn parse_input_event(
     }
 
     if *awaiting_detach_confirm {
-        if key_event.code == KeyCode::Enter {
+        if is_enter_key(&key_event) {
             *awaiting_detach_confirm = false;
             return Some(InputEvent::Detach);
         }
@@ -451,6 +451,17 @@ fn is_q_key(key_event: &KeyEvent) -> bool {
     }
 
     matches!(key_event.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+}
+
+fn is_enter_key(key_event: &KeyEvent) -> bool {
+    if !matches!(key_event.modifiers, KeyModifiers::NONE) {
+        return false;
+    }
+
+    matches!(
+        key_event.code,
+        KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r')
+    )
 }
 
 fn is_pid_running(pid: u32) -> bool {
@@ -514,6 +525,29 @@ mod tests {
         assert_eq!(
             parse_input_event(
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut awaiting_detach_confirm
+            ),
+            Some(InputEvent::Detach)
+        );
+        assert!(!awaiting_detach_confirm);
+    }
+
+    #[test]
+    fn input_state_machine_detaches_on_q_then_newline_char() {
+        let mut awaiting_detach_confirm = false;
+
+        assert_eq!(
+            parse_input_event(
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &mut awaiting_detach_confirm
+            ),
+            None
+        );
+        assert!(awaiting_detach_confirm);
+
+        assert_eq!(
+            parse_input_event(
+                KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE),
                 &mut awaiting_detach_confirm
             ),
             Some(InputEvent::Detach)
