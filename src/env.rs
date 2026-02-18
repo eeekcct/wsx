@@ -105,10 +105,10 @@ fn apply_envrc(workspace_path: &Path, env_map: &mut HashMap<String, String>) -> 
 fn merge_env_output(raw_output: &[u8], env_map: &mut HashMap<String, String>) {
     let output = String::from_utf8_lossy(raw_output);
     for line in output.lines() {
-        if let Some((key, value)) = line.split_once('=') {
-            if !key.is_empty() {
-                env_map.insert(key.to_string(), value.to_string());
-            }
+        if let Some((key, value)) = line.split_once('=')
+            && !key.is_empty()
+        {
+            env_map.insert(key.to_string(), value.to_string());
         }
     }
 }

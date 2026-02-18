@@ -143,7 +143,7 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
     Ok(())
 }
 
-fn running_entries<'a>(pids_file: &'a PidsFile) -> Vec<&'a PidEntry> {
+fn running_entries(pids_file: &PidsFile) -> Vec<&PidEntry> {
     pids_file
         .entries
         .iter()

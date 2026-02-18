@@ -312,10 +312,10 @@ impl FollowControl {
             return Ok(Some(FollowOutcome::Interrupted));
         }
 
-        if let Some(input) = &mut self.input {
-            if let Some(event) = input.poll()? {
-                return Ok(Some(event.into_follow_outcome()));
-            }
+        if let Some(input) = &mut self.input
+            && let Some(event) = input.poll()?
+        {
+            return Ok(Some(event.into_follow_outcome()));
         }
 
         Ok(None)

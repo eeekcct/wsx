@@ -15,20 +15,11 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Defaults {
     pub stop: StopDefaults,
     pub env: EnvDefaults,
     pub logs: LogsDefaults,
-}
-
-impl Default for Defaults {
-    fn default() -> Self {
-        Self {
-            stop: StopDefaults::default(),
-            env: EnvDefaults::default(),
-            logs: LogsDefaults::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -332,10 +323,11 @@ fn validate_log_target(target: &str, process_names: &HashSet<&str>) -> Result<()
         bail!("invalid logs target `{target}`: process name is empty");
     }
 
-    if let Some(stream) = stream {
-        if stream != "out" && stream != "err" {
-            bail!("invalid logs target `{target}`: stream must be out or err");
-        }
+    if let Some(stream) = stream
+        && stream != "out"
+        && stream != "err"
+    {
+        bail!("invalid logs target `{target}`: stream must be out or err");
     }
 
     if !process_names.contains(process_name) {
