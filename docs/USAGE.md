@@ -45,6 +45,7 @@ Start the current workspace when it is in `stopped` state.
 Stop the current running workspace.
 
 - Sends graceful stop first, then force stop if needed.
+- On Windows, internal `taskkill` output is suppressed.
 - If processes still remain after stop attempts, command fails.
 - Keeps `current.json` and sets current state to `stopped` on success.
 

@@ -15,6 +15,10 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
+const POLL_INTERVAL_MS: u64 = 200;
+const FORCE_STOP_TIMEOUT_SECS: u64 = 20;
+const FORCE_RETRY_INTERVAL_SECS: u64 = 2;
+
 pub fn start_workspace(
     workspace: &ResolvedWorkspace,
     instance_id: &str,
@@ -113,21 +117,25 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
         if running_entries(pids_file).is_empty() {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
 
-    for entry in &pids_file.entries {
-        if is_pid_running(entry.pid) {
-            send_force_stop(entry.pid);
-        }
-    }
-
-    let force_deadline = Instant::now() + Duration::from_secs(2);
+    let force_deadline = Instant::now() + Duration::from_secs(FORCE_STOP_TIMEOUT_SECS);
+    let mut next_force_attempt_at = Instant::now();
     while Instant::now() < force_deadline {
-        if running_entries(pids_file).is_empty() {
+        let running = running_entries(pids_file);
+        if running.is_empty() {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(200));
+
+        if Instant::now() >= next_force_attempt_at {
+            for entry in running {
+                send_force_stop(entry.pid);
+            }
+            next_force_attempt_at = Instant::now() + Duration::from_secs(FORCE_RETRY_INTERVAL_SECS);
+        }
+
+        thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
 
     let remaining = running_entries(pids_file);
