@@ -85,14 +85,7 @@ pub fn start_workspace(
         let mut child = match child {
             Ok(child) => child,
             Err(err) => {
-                let partial = PidsFile {
-                    workspace: workspace.name.clone(),
-                    instance_id: instance_id.to_string(),
-                    entries,
-                };
-                if !partial.entries.is_empty() {
-                    let _ = stop_workspace(&partial, workspace.grace_seconds);
-                }
+                cleanup_partial_entries(workspace, instance_id, &entries);
                 return Err(err);
             }
         };
@@ -102,14 +95,7 @@ pub fn start_workspace(
             Err(err) => {
                 let pid = child.id();
                 rollback_untracked_child(&mut child);
-                let partial = PidsFile {
-                    workspace: workspace.name.clone(),
-                    instance_id: instance_id.to_string(),
-                    entries,
-                };
-                if !partial.entries.is_empty() {
-                    let _ = stop_workspace(&partial, workspace.grace_seconds);
-                }
+                cleanup_partial_entries(workspace, instance_id, &entries);
                 bail!(
                     "failed to attach process `{}` (pid {}) to tracking: {err:#}",
                     process.name,
@@ -133,6 +119,19 @@ pub fn start_workspace(
         instance_id: instance_id.to_string(),
         entries,
     })
+}
+
+fn cleanup_partial_entries(workspace: &ResolvedWorkspace, instance_id: &str, entries: &[PidEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+
+    let partial = PidsFile {
+        workspace: workspace.name.clone(),
+        instance_id: instance_id.to_string(),
+        entries: entries.to_vec(),
+    };
+    let _ = stop_workspace(&partial, workspace.grace_seconds);
 }
 
 pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
@@ -233,15 +232,18 @@ where
 }
 
 fn rollback_untracked_child(child: &mut std::process::Child) {
-    let pid = child.id();
+    rollback_untracked_pid(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn rollback_untracked_pid(pid: u32) {
     rollback_untracked_pid_with(
         pid,
         send_graceful_stop,
         is_pid_running,
         force_stop_untracked_pid,
     );
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn rollback_untracked_pid_with<FGraceful, FRunning, FForce>(
@@ -473,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_force_errors_ignores_errors_when_no_entries_remain() -> Result<()> {
+    fn validate_force_errors_ignores_transient_errors_for_exited_failed_pid() -> Result<()> {
         validate_force_errors_with(
             vec![force_error(22334, "web (pid 22334): blocked")],
             |_pid| false,
@@ -532,15 +534,6 @@ mod tests {
 
         assert_eq!(*graceful_calls.borrow(), vec![12345, 12345]);
         assert_eq!(*force_calls.borrow(), vec![12345]);
-    }
-
-    #[test]
-    fn validate_force_errors_ignores_transient_errors_even_if_other_pids_are_running() -> Result<()>
-    {
-        validate_force_errors_with(
-            vec![force_error(22334, "web (pid 22334): blocked")],
-            |_pid| false,
-        )
     }
 
     #[test]
