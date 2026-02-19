@@ -21,44 +21,19 @@ pub fn send_graceful(pid: u32) {
 
 pub fn send_force(pid: u32) {
     let timeout = Duration::from_millis(TASKKILL_FORCE_TIMEOUT_MS);
-    let tree_killed = run_taskkill(&["/PID", &pid.to_string(), "/T", "/F"], timeout);
-    if tree_killed {
-        return;
-    }
-
-    // `/T` can fail when some descendants are protected, but the parent
-    // process may still be terminable.
-    let parent_killed = run_taskkill(&["/PID", &pid.to_string(), "/F"], timeout);
-    if !parent_killed {
-        let _ = run_stop_process_force(pid, timeout);
-    }
+    send_force_with_runner(pid, timeout, run_taskkill);
 }
 
 fn run_taskkill(args: &[&str], timeout: Duration) -> bool {
     run_quiet_command_with_timeout("taskkill", args, timeout)
 }
 
-fn run_stop_process_force(pid: u32, timeout: Duration) -> bool {
-    let script = format!(
-        "try {{ Stop-Process -Id {pid} -Force -ErrorAction Stop; exit 0 }} catch {{ exit 1 }}"
-    );
-
-    run_quiet_command_with_timeout(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ],
-        timeout,
-    ) || run_quiet_command_with_timeout(
-        "pwsh",
-        &["-NoProfile", "-NonInteractive", "-Command", &script],
-        timeout,
-    )
+fn send_force_with_runner<F>(pid: u32, timeout: Duration, mut run_taskkill_cmd: F)
+where
+    F: FnMut(&[&str], Duration) -> bool,
+{
+    let pid = pid.to_string();
+    let _ = run_taskkill_cmd(&["/PID", &pid, "/T", "/F"], timeout);
 }
 
 fn run_quiet_command_with_timeout(program: &str, args: &[&str], timeout: Duration) -> bool {
@@ -90,5 +65,23 @@ fn run_quiet_command_with_timeout(program: &str, args: &[&str], timeout: Duratio
                 return false;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::send_force_with_runner;
+    use std::time::Duration;
+
+    #[test]
+    fn force_stop_uses_single_tree_kill_attempt() {
+        let mut calls = Vec::new();
+        send_force_with_runner(1234, Duration::from_millis(1), |args, _timeout| {
+            calls.push(args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>());
+            false
+        });
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], vec!["/PID", "1234", "/T", "/F"]);
     }
 }
