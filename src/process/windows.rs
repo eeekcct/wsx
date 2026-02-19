@@ -18,6 +18,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const TASKKILL_GRACE_TIMEOUT_MS: u64 = 1500;
+const TASKKILL_FORCE_TIMEOUT_MS: u64 = 1500;
 const TASKKILL_POLL_INTERVAL_MS: u64 = 50;
 const JOB_NAME_PREFIX: &str = r"Global\wsx";
 const MAX_JOB_NAME_LEN: usize = 200;
@@ -57,6 +58,13 @@ pub fn send_graceful(pid: u32) {
     let _ = run_taskkill(
         &["/PID", &pid.to_string(), "/T"],
         Duration::from_millis(TASKKILL_GRACE_TIMEOUT_MS),
+    );
+}
+
+pub fn force_stop_tree(pid: u32) {
+    let _ = run_taskkill(
+        &["/PID", &pid.to_string(), "/T", "/F"],
+        Duration::from_millis(TASKKILL_FORCE_TIMEOUT_MS),
     );
 }
 

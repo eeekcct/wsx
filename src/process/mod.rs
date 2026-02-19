@@ -19,6 +19,12 @@ const POLL_INTERVAL_MS: u64 = 200;
 const FORCE_STOP_TIMEOUT_SECS: u64 = 20;
 const FORCE_RETRY_INTERVAL_SECS: u64 = 2;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForceStopError {
+    pid: u32,
+    message: String,
+}
+
 pub fn start_workspace(
     workspace: &ResolvedWorkspace,
     instance_id: &str,
@@ -94,8 +100,8 @@ pub fn start_workspace(
         let windows_job_name = match attach_process_tracking(instance_id, &process.name, &child) {
             Ok(value) => value,
             Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let pid = child.id();
+                rollback_untracked_child(&mut child);
                 let partial = PidsFile {
                     workspace: workspace.name.clone(),
                     instance_id: instance_id.to_string(),
@@ -107,7 +113,7 @@ pub fn start_workspace(
                 bail!(
                     "failed to attach process `{}` (pid {}) to tracking: {err:#}",
                     process.name,
-                    child.id()
+                    pid
                 );
             }
         };
@@ -154,7 +160,7 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
             // Try force-stop for every running entry in this snapshot before
             // deciding whether this attempt should fail.
             let force_errors = collect_force_stop_errors(running, force_stop_entry);
-            validate_force_errors_with(force_errors, || running_entries(pids_file).len())?;
+            validate_force_errors_with(force_errors, is_pid_running)?;
             next_force_attempt_at = Instant::now() + Duration::from_secs(FORCE_RETRY_INTERVAL_SECS);
         }
 
@@ -178,7 +184,10 @@ fn force_stop_entry(entry: &PidEntry) -> Result<()> {
     force_stop_entry_with(entry, send_force_stop, is_pid_running)
 }
 
-fn collect_force_stop_errors<'a, I, F>(running: I, mut force_stop_entry_fn: F) -> Vec<String>
+fn collect_force_stop_errors<'a, I, F>(
+    running: I,
+    mut force_stop_entry_fn: F,
+) -> Vec<ForceStopError>
 where
     I: IntoIterator<Item = &'a PidEntry>,
     F: FnMut(&PidEntry) -> Result<()>,
@@ -186,32 +195,69 @@ where
     let mut errors = Vec::new();
     for entry in running {
         if let Err(err) = force_stop_entry_fn(entry) {
-            errors.push(format!("{} (pid {}): {err:#}", entry.name, entry.pid));
+            errors.push(ForceStopError {
+                pid: entry.pid,
+                message: format!("{} (pid {}): {err:#}", entry.name, entry.pid),
+            });
         }
     }
     errors
 }
 
 fn validate_force_errors_with<F>(
-    force_errors: Vec<String>,
-    mut running_entries_count_fn: F,
+    force_errors: Vec<ForceStopError>,
+    mut is_pid_running_fn: F,
 ) -> Result<()>
 where
-    F: FnMut() -> usize,
+    F: FnMut(u32) -> bool,
 {
     if force_errors.is_empty() {
         return Ok(());
     }
 
-    if running_entries_count_fn() == 0 {
-        // All tracked processes are now gone, so earlier per-process errors were transient.
+    let remaining_errors = force_errors
+        .into_iter()
+        .filter(|error| is_pid_running_fn(error.pid))
+        .map(|error| error.message)
+        .collect::<Vec<_>>();
+
+    if remaining_errors.is_empty() {
+        // All failed PIDs are now gone, so earlier per-process errors were transient.
         return Ok(());
     }
 
     bail!(
         "failed to force stop processes: {}",
-        force_errors.join("; ")
+        remaining_errors.join("; ")
     );
+}
+
+fn rollback_untracked_child(child: &mut std::process::Child) {
+    let pid = child.id();
+    rollback_untracked_pid_with(
+        pid,
+        send_graceful_stop,
+        is_pid_running,
+        force_stop_untracked_pid,
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn rollback_untracked_pid_with<FGraceful, FRunning, FForce>(
+    pid: u32,
+    mut send_graceful_stop_fn: FGraceful,
+    mut is_pid_running_fn: FRunning,
+    mut force_stop_pid_tree_fn: FForce,
+) where
+    FGraceful: FnMut(u32),
+    FRunning: FnMut(u32) -> bool,
+    FForce: FnMut(u32),
+{
+    send_graceful_stop_fn(pid);
+    if is_pid_running_fn(pid) {
+        force_stop_pid_tree_fn(pid);
+    }
 }
 
 fn force_stop_entry_with<FStop, FRunning>(
@@ -310,9 +356,22 @@ fn send_force_stop(entry: &PidEntry) -> Result<()> {
     windows::send_force(entry)
 }
 
+#[cfg(unix)]
+fn force_stop_untracked_pid(pid: u32) {
+    unix::send_force(pid);
+}
+
+#[cfg(windows)]
+fn force_stop_untracked_pid(pid: u32) {
+    windows::force_stop_tree(pid);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{collect_force_stop_errors, force_stop_entry_with, validate_force_errors_with};
+    use super::{
+        ForceStopError, collect_force_stop_errors, force_stop_entry_with,
+        rollback_untracked_pid_with, validate_force_errors_with,
+    };
     use crate::state::PidEntry;
     use anyhow::{Result, anyhow};
     use std::cell::{Cell, RefCell};
@@ -401,24 +460,34 @@ mod tests {
         assert_eq!(*called.borrow(), vec![12345, 22334, 33445]);
         assert_eq!(errors.len(), 1);
         assert!(
-            errors[0].contains("web (pid 22334)"),
+            errors[0].message.contains("web (pid 22334)"),
             "unexpected error list: {errors:?}"
         );
     }
 
-    #[test]
-    fn validate_force_errors_ignores_errors_when_no_entries_remain() -> Result<()> {
-        validate_force_errors_with(vec!["web (pid 22334): blocked".to_string()], || 0)
+    fn force_error(pid: u32, message: &str) -> ForceStopError {
+        ForceStopError {
+            pid,
+            message: message.to_string(),
+        }
     }
 
     #[test]
-    fn validate_force_errors_fails_when_entries_still_running() {
+    fn validate_force_errors_ignores_errors_when_no_entries_remain() -> Result<()> {
+        validate_force_errors_with(
+            vec![force_error(22334, "web (pid 22334): blocked")],
+            |_pid| false,
+        )
+    }
+
+    #[test]
+    fn validate_force_errors_fails_when_failed_pid_still_running() {
         let result = validate_force_errors_with(
             vec![
-                "web (pid 22334): blocked".to_string(),
-                "tree (pid 12345): denied".to_string(),
+                force_error(22334, "web (pid 22334): blocked"),
+                force_error(12345, "tree (pid 12345): denied"),
             ],
-            || 2,
+            |pid| pid == 22334,
         );
         assert!(result.is_err(), "expected validation failure");
         let message = format!("{:#}", result.expect_err("expected force-stop error"));
@@ -431,8 +500,67 @@ mod tests {
             "missing first aggregated error: {message}"
         );
         assert!(
-            message.contains("tree (pid 12345): denied"),
-            "missing second aggregated error: {message}"
+            !message.contains("tree (pid 12345): denied"),
+            "errors for already-exited failed pid should be dropped: {message}"
+        );
+    }
+
+    #[test]
+    fn rollback_untracked_pid_uses_force_only_when_still_running() {
+        let graceful_calls = RefCell::new(Vec::new());
+        let force_calls = RefCell::new(Vec::new());
+
+        rollback_untracked_pid_with(
+            12345,
+            |pid| graceful_calls.borrow_mut().push(pid),
+            |_pid| false,
+            |pid| force_calls.borrow_mut().push(pid),
+        );
+
+        assert_eq!(*graceful_calls.borrow(), vec![12345]);
+        assert!(
+            force_calls.borrow().is_empty(),
+            "force-stop should not be called when pid already exited"
+        );
+
+        rollback_untracked_pid_with(
+            12345,
+            |pid| graceful_calls.borrow_mut().push(pid),
+            |_pid| true,
+            |pid| force_calls.borrow_mut().push(pid),
+        );
+
+        assert_eq!(*graceful_calls.borrow(), vec![12345, 12345]);
+        assert_eq!(*force_calls.borrow(), vec![12345]);
+    }
+
+    #[test]
+    fn validate_force_errors_ignores_transient_errors_even_if_other_pids_are_running() -> Result<()>
+    {
+        validate_force_errors_with(
+            vec![force_error(22334, "web (pid 22334): blocked")],
+            |_pid| false,
+        )
+    }
+
+    #[test]
+    fn validate_force_errors_returns_all_remaining_failed_pids() {
+        let result = validate_force_errors_with(
+            vec![
+                force_error(22334, "web (pid 22334): blocked"),
+                force_error(33445, "worker (pid 33445): denied"),
+            ],
+            |_pid| true,
+        );
+        assert!(result.is_err(), "expected validation failure");
+        let message = format!("{:#}", result.expect_err("expected force-stop error"));
+        assert!(
+            message.contains("web (pid 22334): blocked"),
+            "missing first remaining error: {message}"
+        );
+        assert!(
+            message.contains("worker (pid 33445): denied"),
+            "missing second remaining error: {message}"
         );
     }
 }
