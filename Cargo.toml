@@ -20,3 +20,11 @@ crossterm = "0.29.0"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.0", features = ["signal", "term"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }

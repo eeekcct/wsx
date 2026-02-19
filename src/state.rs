@@ -41,6 +41,7 @@ pub struct PidEntry {
     pub out_log: String,
     pub err_log: String,
     pub combined_log: String,
+    pub windows_job_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +121,7 @@ mod tests {
                 out_log: "o".to_string(),
                 err_log: "e".to_string(),
                 combined_log: "c".to_string(),
+                windows_job_name: None,
             }],
         };
 

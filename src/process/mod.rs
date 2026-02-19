@@ -76,7 +76,7 @@ pub fn start_workspace(
             )
         });
 
-        let child = match child {
+        let mut child = match child {
             Ok(child) => child,
             Err(err) => {
                 let partial = PidsFile {
@@ -91,12 +91,34 @@ pub fn start_workspace(
             }
         };
 
+        let windows_job_name = match attach_process_tracking(instance_id, &process.name, &child) {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let partial = PidsFile {
+                    workspace: workspace.name.clone(),
+                    instance_id: instance_id.to_string(),
+                    entries,
+                };
+                if !partial.entries.is_empty() {
+                    let _ = stop_workspace(&partial, workspace.grace_seconds);
+                }
+                bail!(
+                    "failed to attach process `{}` (pid {}) to tracking: {err:#}",
+                    process.name,
+                    child.id()
+                );
+            }
+        };
+
         entries.push(PidEntry {
             name: process.name.clone(),
             pid: child.id(),
             out_log: out_path.to_string_lossy().to_string(),
             err_log: err_path.to_string_lossy().to_string(),
             combined_log: combined_path.to_string_lossy().to_string(),
+            windows_job_name,
         });
     }
 
@@ -130,7 +152,12 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
 
         if Instant::now() >= next_force_attempt_at {
             for entry in running {
-                send_force_stop(entry.pid);
+                send_force_stop(entry).with_context(|| {
+                    format!(
+                        "failed to force stop process `{}` (pid {})",
+                        entry.name, entry.pid
+                    )
+                })?;
             }
             next_force_attempt_at = Instant::now() + Duration::from_secs(FORCE_RETRY_INTERVAL_SECS);
         }
@@ -172,6 +199,24 @@ pub fn is_pid_running(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
+fn attach_process_tracking(
+    _instance_id: &str,
+    _process_name: &str,
+    _child: &std::process::Child,
+) -> Result<Option<String>> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn attach_process_tracking(
+    instance_id: &str,
+    process_name: &str,
+    child: &std::process::Child,
+) -> Result<Option<String>> {
+    windows::attach_to_job(instance_id, process_name, child).map(Some)
+}
+
+#[cfg(unix)]
 fn apply_spawn_settings(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
@@ -193,11 +238,12 @@ fn send_graceful_stop(pid: u32) {
 }
 
 #[cfg(unix)]
-fn send_force_stop(pid: u32) {
-    unix::send_force(pid);
+fn send_force_stop(entry: &PidEntry) -> Result<()> {
+    unix::send_force(entry.pid);
+    Ok(())
 }
 
 #[cfg(windows)]
-fn send_force_stop(pid: u32) {
-    windows::send_force(pid);
+fn send_force_stop(entry: &PidEntry) -> Result<()> {
+    windows::send_force(entry)
 }
