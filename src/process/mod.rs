@@ -151,9 +151,10 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
         }
 
         if Instant::now() >= next_force_attempt_at {
-            for entry in running {
-                force_stop_entry(entry)?;
-            }
+            // Try force-stop for every running entry in this snapshot before
+            // deciding whether this attempt should fail.
+            let force_errors = collect_force_stop_errors(running, force_stop_entry);
+            validate_force_errors_with(force_errors, || running_entries(pids_file).len())?;
             next_force_attempt_at = Instant::now() + Duration::from_secs(FORCE_RETRY_INTERVAL_SECS);
         }
 
@@ -175,6 +176,42 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
 
 fn force_stop_entry(entry: &PidEntry) -> Result<()> {
     force_stop_entry_with(entry, send_force_stop, is_pid_running)
+}
+
+fn collect_force_stop_errors<'a, I, F>(running: I, mut force_stop_entry_fn: F) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a PidEntry>,
+    F: FnMut(&PidEntry) -> Result<()>,
+{
+    let mut errors = Vec::new();
+    for entry in running {
+        if let Err(err) = force_stop_entry_fn(entry) {
+            errors.push(format!("{} (pid {}): {err:#}", entry.name, entry.pid));
+        }
+    }
+    errors
+}
+
+fn validate_force_errors_with<F>(
+    force_errors: Vec<String>,
+    mut running_entries_count_fn: F,
+) -> Result<()>
+where
+    F: FnMut() -> usize,
+{
+    if force_errors.is_empty() {
+        return Ok(());
+    }
+
+    if running_entries_count_fn() == 0 {
+        // All tracked processes are now gone, so earlier per-process errors were transient.
+        return Ok(());
+    }
+
+    bail!(
+        "failed to force stop processes: {}",
+        force_errors.join("; ")
+    );
 }
 
 fn force_stop_entry_with<FStop, FRunning>(
@@ -275,10 +312,10 @@ fn send_force_stop(entry: &PidEntry) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::force_stop_entry_with;
+    use super::{collect_force_stop_errors, force_stop_entry_with, validate_force_errors_with};
     use crate::state::PidEntry;
     use anyhow::{Result, anyhow};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     fn sample_entry() -> PidEntry {
         PidEntry {
@@ -339,5 +376,63 @@ mod tests {
             "liveness should not be checked on successful force-stop"
         );
         Ok(())
+    }
+
+    #[test]
+    fn force_stop_attempts_all_entries_before_returning_errors() {
+        let a = sample_entry();
+        let mut b = sample_entry();
+        b.name = "web".to_string();
+        b.pid = 22334;
+        let mut c = sample_entry();
+        c.name = "worker".to_string();
+        c.pid = 33445;
+
+        let called = RefCell::new(Vec::new());
+        let errors = collect_force_stop_errors(vec![&a, &b, &c], |entry| {
+            called.borrow_mut().push(entry.pid);
+            if entry.pid == 22334 {
+                Err(anyhow!("blocked"))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(*called.borrow(), vec![12345, 22334, 33445]);
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("web (pid 22334)"),
+            "unexpected error list: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_force_errors_ignores_errors_when_no_entries_remain() -> Result<()> {
+        validate_force_errors_with(vec!["web (pid 22334): blocked".to_string()], || 0)
+    }
+
+    #[test]
+    fn validate_force_errors_fails_when_entries_still_running() {
+        let result = validate_force_errors_with(
+            vec![
+                "web (pid 22334): blocked".to_string(),
+                "tree (pid 12345): denied".to_string(),
+            ],
+            || 2,
+        );
+        assert!(result.is_err(), "expected validation failure");
+        let message = format!("{:#}", result.expect_err("expected force-stop error"));
+        assert!(
+            message.contains("failed to force stop processes:"),
+            "unexpected error text: {message}"
+        );
+        assert!(
+            message.contains("web (pid 22334): blocked"),
+            "missing first aggregated error: {message}"
+        );
+        assert!(
+            message.contains("tree (pid 12345): denied"),
+            "missing second aggregated error: {message}"
+        );
     }
 }
