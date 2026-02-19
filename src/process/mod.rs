@@ -152,12 +152,7 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
 
         if Instant::now() >= next_force_attempt_at {
             for entry in running {
-                send_force_stop(entry).with_context(|| {
-                    format!(
-                        "failed to force stop process `{}` (pid {})",
-                        entry.name, entry.pid
-                    )
-                })?;
+                force_stop_entry(entry)?;
             }
             next_force_attempt_at = Instant::now() + Duration::from_secs(FORCE_RETRY_INTERVAL_SECS);
         }
@@ -176,6 +171,36 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn force_stop_entry(entry: &PidEntry) -> Result<()> {
+    force_stop_entry_with(entry, send_force_stop, is_pid_running)
+}
+
+fn force_stop_entry_with<FStop, FRunning>(
+    entry: &PidEntry,
+    mut send_force_stop_fn: FStop,
+    mut is_pid_running_fn: FRunning,
+) -> Result<()>
+where
+    FStop: FnMut(&PidEntry) -> Result<()>,
+    FRunning: FnMut(u32) -> bool,
+{
+    match send_force_stop_fn(entry) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if !is_pid_running_fn(entry.pid) {
+                // Process exited between snapshot and force-stop attempt.
+                return Ok(());
+            }
+            Err(err).with_context(|| {
+                format!(
+                    "failed to force stop process `{}` (pid {})",
+                    entry.name, entry.pid
+                )
+            })
+        }
+    }
 }
 
 fn running_entries(pids_file: &PidsFile) -> Vec<&PidEntry> {
@@ -246,4 +271,73 @@ fn send_force_stop(entry: &PidEntry) -> Result<()> {
 #[cfg(windows)]
 fn send_force_stop(entry: &PidEntry) -> Result<()> {
     windows::send_force(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::force_stop_entry_with;
+    use crate::state::PidEntry;
+    use anyhow::{Result, anyhow};
+    use std::cell::Cell;
+
+    fn sample_entry() -> PidEntry {
+        PidEntry {
+            name: "tree".to_string(),
+            pid: 12345,
+            out_log: "out.log".to_string(),
+            err_log: "err.log".to_string(),
+            combined_log: "combined.log".to_string(),
+            windows_job_name: Some(r"Global\wsx-demo-tree-12345".to_string()),
+        }
+    }
+
+    #[test]
+    fn force_stop_error_is_ignored_when_pid_already_exited() {
+        let entry = sample_entry();
+        let result =
+            force_stop_entry_with(&entry, |_entry| Err(anyhow!("job not found")), |_pid| false);
+        assert!(
+            result.is_ok(),
+            "race-condition error should be ignored when pid already exited"
+        );
+    }
+
+    #[test]
+    fn force_stop_error_is_returned_when_pid_still_running() {
+        let entry = sample_entry();
+        let result = force_stop_entry_with(
+            &entry,
+            |_entry| Err(anyhow!("permission denied")),
+            |_pid| true,
+        );
+        assert!(
+            result.is_err(),
+            "error should be returned when pid is alive"
+        );
+        let err_text = format!("{:#}", result.expect_err("expected force-stop failure"));
+        assert!(
+            err_text.contains("failed to force stop process `tree` (pid 12345)"),
+            "unexpected error text: {err_text}"
+        );
+    }
+
+    #[test]
+    fn force_stop_success_does_not_recheck_liveness() -> Result<()> {
+        let entry = sample_entry();
+        let liveness_checks = Cell::new(0usize);
+        force_stop_entry_with(
+            &entry,
+            |_entry| Ok(()),
+            |_pid| {
+                liveness_checks.set(liveness_checks.get() + 1);
+                true
+            },
+        )?;
+        assert_eq!(
+            liveness_checks.get(),
+            0,
+            "liveness should not be checked on successful force-stop"
+        );
+        Ok(())
+    }
 }
