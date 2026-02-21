@@ -534,7 +534,7 @@ mod linux_e2e {
     }
 
     #[test]
-    fn list_shows_sorted_and_marks_current_workspace() {
+    fn list_sorts_and_marks_current() {
         let env = TestEnv::new("list");
         let zeta = env.create_workspace("zeta");
         let alpha = env.create_workspace("alpha");
@@ -581,7 +581,7 @@ workspaces:
     }
 
     #[test]
-    fn down_without_current_prints_no_current_workspace() {
+    fn down_noops_when_no_current() {
         let env = TestEnv::new("down-no-current");
         let down = env.run(&["down"]);
         assert_success(&down);
@@ -710,6 +710,10 @@ workspaces:
         let status_after_down_stdout = stdout(&status_after_down);
         assert!(status_after_down_stdout.contains("Current workspace: deva"));
         assert!(status_after_down_stdout.contains("State: stopped"));
+
+        let list_after_down = env.run(&["list"]);
+        assert_success(&list_after_down);
+        assert_stdout_contains_all(&list_after_down, &["* deva"]);
     }
 
     #[test]
@@ -796,39 +800,7 @@ workspaces:
     }
 
     #[test]
-    fn list_marks_current_after_down() {
-        let env = TestEnv::new("list-after-down");
-        let demo = env.create_workspace("demo");
-
-        env.write_config(&format!(
-            r#"defaults:
-  env:
-    dotenv: [.env]
-    envrc: false
-workspaces:
-  demo:
-    path: {}
-    processes:
-      - name: app
-        cmd: ["sh", "-lc", "echo boot; sleep 1"]
-"#,
-            yaml_path(&demo),
-        ));
-
-        let switch = env.run(&["demo"]);
-        assert_success(&switch);
-
-        let down = env.run(&["down"]);
-        assert_success(&down);
-        assert_down_succeeded_message(&down, "demo");
-
-        let list = env.run(&["list"]);
-        assert_success(&list);
-        assert_stdout_contains_all(&list, &["* demo"]);
-    }
-
-    #[test]
-    fn status_reconciles_current_state_when_processes_already_stopped() {
+    fn status_reconciles_when_stale_running() {
         let env = TestEnv::new("status-reconcile");
         let demo = env.create_workspace("demo");
 
@@ -870,7 +842,7 @@ workspaces:
     }
 
     #[test]
-    fn up_restarts_when_current_processes_already_stopped() {
+    fn up_restarts_when_stale_running() {
         let env = TestEnv::new("up-restarts-stale-running");
         let demo = env.create_workspace("demo");
 
@@ -949,7 +921,7 @@ workspaces:
     }
 
     #[test]
-    fn logs_implicit_default_falls_back_to_first_process() {
+    fn logs_use_first_when_no_default() {
         let env = TestEnv::new("logs-default-first-process");
         let demo = env.create_workspace("demo");
 
@@ -963,9 +935,9 @@ workspaces:
     path: {}
     processes:
       - name: api
-        cmd: ["sh", "-lc", "echo api-only; sleep 1"]
+        cmd: ["sh", "-lc", "echo api-only; sleep 2"]
       - name: worker
-        cmd: ["sh", "-lc", "echo worker-only; sleep 1"]
+        cmd: ["sh", "-lc", "echo worker-only; sleep 2"]
 "#,
             yaml_path(&demo),
         ));
@@ -973,8 +945,13 @@ workspaces:
         let switch = env.run(&["demo"]);
         assert_success(&switch);
 
+        let started_at = Instant::now();
         let logs = env.run(&["logs", "--no-follow"]);
         assert_success(&logs);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(1),
+            "logs --no-follow should return without waiting for process exit"
+        );
         let out = stdout(&logs);
         assert!(out.contains("api-only"));
         assert!(!out.contains("worker-only"));
@@ -1012,39 +989,6 @@ workspaces:
     }
 
     #[test]
-    fn logs_no_follow_returns_immediately() {
-        let env = TestEnv::new("logs-no-follow");
-        let demo = env.create_workspace("demo");
-
-        env.write_config(&format!(
-            r#"defaults:
-  env:
-    dotenv: [.env]
-    envrc: false
-workspaces:
-  demo:
-    path: {}
-    processes:
-      - name: backend
-        default_log: true
-        cmd: ["sh", "-lc", "echo backend-out; sleep 2"]
-"#,
-            yaml_path(&demo),
-        ));
-
-        let switch = env.run(&["demo"]);
-        assert_success(&switch);
-
-        let started_at = Instant::now();
-        let logs = env.run(&["logs", "--no-follow"]);
-        assert_success(&logs);
-        assert!(
-            started_at.elapsed() < Duration::from_secs(1),
-            "logs --no-follow should return without waiting for process exit"
-        );
-    }
-
-    #[test]
     fn logs_invalid_target_fails() {
         let env = TestEnv::new("logs-invalid-target");
         let demo = env.create_workspace("demo");
@@ -1077,7 +1021,7 @@ workspaces:
     }
 
     #[test]
-    fn q_detach_restores_terminal_and_keeps_workspace_running_with_null_stdin() {
+    fn q_detach_restores_tty_when_following() {
         let env = TestEnv::new("q-detach-keeps-running");
         let demo = env.create_workspace("demo");
 
@@ -1137,7 +1081,7 @@ workspaces:
     }
 
     #[test]
-    fn ctrl_c_during_workspace_follow_stops_workspace_before_exit() {
+    fn ctrlc_stops_before_exit_when_workspace_follow() {
         let env = TestEnv::new("ctrlc-workspace-follow");
         let demo = env.create_workspace("demo");
 
@@ -1196,7 +1140,7 @@ workspaces:
     }
 
     #[test]
-    fn ctrl_c_during_logs_follow_stops_workspace_before_exit() {
+    fn ctrlc_stops_before_exit_when_logs_follow() {
         let env = TestEnv::new("ctrlc-logs-follow");
         let demo = env.create_workspace("demo");
 
@@ -1265,7 +1209,7 @@ workspaces:
     }
 
     #[test]
-    fn multi_process_workspace_status_and_logs_targets_work() {
+    fn status_and_logs_work_when_multi_process() {
         let env = TestEnv::new("multi-process");
         let demo = env.create_workspace("demo");
 
@@ -1691,7 +1635,7 @@ workspaces:
     }
 
     #[test]
-    fn switch_stops_previous_workspace_processes() {
+    fn switch_stops_previous_workspace() {
         let env = TestEnv::new("switch-stops-previous");
         let alpha = env.create_workspace("alpha");
         let beta = env.create_workspace("beta");
@@ -1760,6 +1704,7 @@ workspaces:
         let env = TestEnv::new("exec");
         let demo = env.create_workspace("demo");
         let marker = demo.join("exec-result.txt");
+        let cwd_marker = demo.join("cwd.txt");
 
         fs::write(demo.join(".env"), "WSX_EXEC_MARK=from-dotenv\n").expect("failed to write .env");
 
@@ -1791,35 +1736,9 @@ workspaces:
 
         let marker_content = fs::read_to_string(marker).expect("exec marker should be created");
         assert_eq!(marker_content, "from-dotenv");
-    }
 
-    #[test]
-    fn exec_runs_in_workspace_cwd() {
-        let env = TestEnv::new("exec-cwd");
-        let demo = env.create_workspace("demo");
-        let cwd_marker = demo.join("cwd.txt");
-
-        env.write_config(&format!(
-            r#"defaults:
-  env:
-    dotenv: [.env]
-    envrc: false
-workspaces:
-  demo:
-    path: {}
-    processes:
-      - name: app
-        cmd: ["sh", "-lc", "echo boot; sleep 1"]
-"#,
-            yaml_path(&demo),
-        ));
-
-        let switch = env.run(&["demo"]);
-        assert_success(&switch);
-
-        let exec = env.run(&["exec", "sh", "-c", "pwd > cwd.txt"]);
-        assert_success(&exec);
-
+        let exec_cwd = env.run(&["exec", "sh", "-c", "pwd > cwd.txt"]);
+        assert_success(&exec_cwd);
         let cwd = fs::read_to_string(cwd_marker).expect("cwd marker should be created");
         assert_eq!(cwd.trim(), demo.to_string_lossy());
     }
