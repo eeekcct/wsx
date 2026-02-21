@@ -5,6 +5,7 @@ mod linux_e2e {
     use nix::sys::termios::{Termios, tcgetattr};
     use nix::unistd::Pid;
     use serde::Deserialize;
+    use std::collections::{HashMap, HashSet};
     use std::fs::{self, File};
     use std::io::Write;
     use std::os::fd::AsFd;
@@ -359,6 +360,22 @@ mod linux_e2e {
             .map(|entry| entry.pid)
     }
 
+    fn current_process_pids(env: &TestEnv) -> Option<Vec<u32>> {
+        let instance_id = current_instance_id(env)?;
+        let pids_path = env
+            .wsx_home()
+            .join("instances")
+            .join(instance_id)
+            .join("pids.json");
+        if !pids_path.exists() {
+            return None;
+        }
+
+        let raw = fs::read_to_string(pids_path).expect("failed to read pids.json");
+        let meta: PidsMeta = serde_json::from_str(&raw).expect("invalid pids.json");
+        Some(meta.entries.iter().map(|entry| entry.pid).collect())
+    }
+
     fn wait_for_current_status(env: &TestEnv, expected: &str, timeout: Duration) -> bool {
         wait_until(timeout, || {
             current_meta(env).is_some_and(|meta| meta.status.as_deref() == Some(expected))
@@ -380,8 +397,144 @@ mod linux_e2e {
         Path::new("/proc").join(pid.to_string()).exists()
     }
 
+    fn read_proc_state(pid: u32) -> Option<char> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let close_paren = stat.rfind(')')?;
+        stat.get(close_paren + 2..)?.chars().next()
+    }
+
+    fn proc_ppid_map() -> HashMap<u32, u32> {
+        let mut out = HashMap::new();
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return out;
+        };
+
+        for entry in entries.flatten() {
+            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok();
+            let Some(pid) = pid else {
+                continue;
+            };
+
+            let status_path = entry.path().join("status");
+            let Ok(status) = fs::read_to_string(status_path) else {
+                continue;
+            };
+            let ppid = status
+                .lines()
+                .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<u32>().ok());
+            if let Some(ppid) = ppid {
+                out.insert(pid, ppid);
+            }
+        }
+
+        out
+    }
+
+    fn read_proc_cmdline(pid: u32) -> Option<String> {
+        let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        if raw.is_empty() {
+            return None;
+        }
+
+        let args = raw
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>();
+        if args.is_empty() {
+            None
+        } else {
+            Some(args.join(" "))
+        }
+    }
+
+    fn collect_descendants(root_pid: u32) -> Vec<u32> {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (pid, ppid) in proc_ppid_map() {
+            children.entry(ppid).or_default().push(pid);
+        }
+
+        let mut descendants = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![root_pid];
+
+        while let Some(pid) = stack.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+
+            if let Some(child_pids) = children.get(&pid) {
+                for child_pid in child_pids {
+                    descendants.push(*child_pid);
+                    stack.push(*child_pid);
+                }
+            }
+        }
+
+        descendants.sort_unstable();
+        descendants.dedup();
+        descendants
+    }
+
+    fn snapshot_process_tree(root_pids: &[u32]) -> Vec<u32> {
+        let mut tracked = HashSet::new();
+        for root_pid in root_pids {
+            tracked.insert(*root_pid);
+            for descendant in collect_descendants(*root_pid) {
+                tracked.insert(descendant);
+            }
+        }
+
+        let mut out = tracked.into_iter().collect::<Vec<_>>();
+        out.sort_unstable();
+        out
+    }
+
+    fn zombie_details(tracked_pids: &[u32]) -> Vec<String> {
+        let ppid_map = proc_ppid_map();
+        tracked_pids
+            .iter()
+            .filter_map(|pid| {
+                let state = read_proc_state(*pid)?;
+                if state != 'Z' {
+                    return None;
+                }
+
+                let ppid = ppid_map
+                    .get(pid)
+                    .map(u32::to_string)
+                    .unwrap_or_else(|| "?".to_string());
+                let cmdline =
+                    read_proc_cmdline(*pid).unwrap_or_else(|| "<unavailable>".to_string());
+                Some(format!(
+                    "pid={pid} ppid={ppid} state={state} cmdline={cmdline}"
+                ))
+            })
+            .collect()
+    }
+
+    fn assert_no_zombies_for_tree(tracked_pids: &[u32], timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let zombies = zombie_details(tracked_pids);
+            if zombies.is_empty() {
+                return;
+            }
+
+            if Instant::now() >= deadline {
+                panic!(
+                    "zombie processes remained after {:?}:\n{}",
+                    timeout,
+                    zombies.join("\n")
+                );
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     #[test]
-    fn list_shows_sorted_and_marks_current_workspace() {
+    fn list_sorts_and_marks_current() {
         let env = TestEnv::new("list");
         let zeta = env.create_workspace("zeta");
         let alpha = env.create_workspace("alpha");
@@ -428,7 +581,7 @@ workspaces:
     }
 
     #[test]
-    fn down_without_current_prints_no_current_workspace() {
+    fn down_noops_when_no_current() {
         let env = TestEnv::new("down-no-current");
         let down = env.run(&["down"]);
         assert_success(&down);
@@ -557,6 +710,10 @@ workspaces:
         let status_after_down_stdout = stdout(&status_after_down);
         assert!(status_after_down_stdout.contains("Current workspace: deva"));
         assert!(status_after_down_stdout.contains("State: stopped"));
+
+        let list_after_down = env.run(&["list"]);
+        assert_success(&list_after_down);
+        assert_stdout_contains_all(&list_after_down, &["* deva"]);
     }
 
     #[test]
@@ -643,39 +800,7 @@ workspaces:
     }
 
     #[test]
-    fn list_marks_current_after_down() {
-        let env = TestEnv::new("list-after-down");
-        let demo = env.create_workspace("demo");
-
-        env.write_config(&format!(
-            r#"defaults:
-  env:
-    dotenv: [.env]
-    envrc: false
-workspaces:
-  demo:
-    path: {}
-    processes:
-      - name: app
-        cmd: ["sh", "-lc", "echo boot; sleep 1"]
-"#,
-            yaml_path(&demo),
-        ));
-
-        let switch = env.run(&["demo"]);
-        assert_success(&switch);
-
-        let down = env.run(&["down"]);
-        assert_success(&down);
-        assert_down_succeeded_message(&down, "demo");
-
-        let list = env.run(&["list"]);
-        assert_success(&list);
-        assert_stdout_contains_all(&list, &["* demo"]);
-    }
-
-    #[test]
-    fn status_reconciles_current_state_when_processes_already_stopped() {
+    fn status_reconciles_when_stale_running() {
         let env = TestEnv::new("status-reconcile");
         let demo = env.create_workspace("demo");
 
@@ -717,7 +842,7 @@ workspaces:
     }
 
     #[test]
-    fn up_restarts_when_current_processes_already_stopped() {
+    fn up_restarts_when_stale_running() {
         let env = TestEnv::new("up-restarts-stale-running");
         let demo = env.create_workspace("demo");
 
@@ -796,7 +921,7 @@ workspaces:
     }
 
     #[test]
-    fn logs_implicit_default_falls_back_to_first_process() {
+    fn logs_use_first_when_no_default() {
         let env = TestEnv::new("logs-default-first-process");
         let demo = env.create_workspace("demo");
 
@@ -810,9 +935,9 @@ workspaces:
     path: {}
     processes:
       - name: api
-        cmd: ["sh", "-lc", "echo api-only; sleep 1"]
+        cmd: ["sh", "-lc", "echo api-only; sleep 2"]
       - name: worker
-        cmd: ["sh", "-lc", "echo worker-only; sleep 1"]
+        cmd: ["sh", "-lc", "echo worker-only; sleep 2"]
 "#,
             yaml_path(&demo),
         ));
@@ -820,8 +945,13 @@ workspaces:
         let switch = env.run(&["demo"]);
         assert_success(&switch);
 
+        let started_at = Instant::now();
         let logs = env.run(&["logs", "--no-follow"]);
         assert_success(&logs);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(1),
+            "logs --no-follow should return without waiting for process exit"
+        );
         let out = stdout(&logs);
         assert!(out.contains("api-only"));
         assert!(!out.contains("worker-only"));
@@ -859,39 +989,6 @@ workspaces:
     }
 
     #[test]
-    fn logs_no_follow_returns_immediately() {
-        let env = TestEnv::new("logs-no-follow");
-        let demo = env.create_workspace("demo");
-
-        env.write_config(&format!(
-            r#"defaults:
-  env:
-    dotenv: [.env]
-    envrc: false
-workspaces:
-  demo:
-    path: {}
-    processes:
-      - name: backend
-        default_log: true
-        cmd: ["sh", "-lc", "echo backend-out; sleep 2"]
-"#,
-            yaml_path(&demo),
-        ));
-
-        let switch = env.run(&["demo"]);
-        assert_success(&switch);
-
-        let started_at = Instant::now();
-        let logs = env.run(&["logs", "--no-follow"]);
-        assert_success(&logs);
-        assert!(
-            started_at.elapsed() < Duration::from_secs(1),
-            "logs --no-follow should return without waiting for process exit"
-        );
-    }
-
-    #[test]
     fn logs_invalid_target_fails() {
         let env = TestEnv::new("logs-invalid-target");
         let demo = env.create_workspace("demo");
@@ -924,7 +1021,7 @@ workspaces:
     }
 
     #[test]
-    fn q_detach_restores_terminal_and_keeps_workspace_running_with_null_stdin() {
+    fn q_detach_restores_tty_when_following() {
         let env = TestEnv::new("q-detach-keeps-running");
         let demo = env.create_workspace("demo");
 
@@ -984,7 +1081,7 @@ workspaces:
     }
 
     #[test]
-    fn ctrl_c_during_workspace_follow_stops_workspace_before_exit() {
+    fn ctrlc_stops_before_exit_when_workspace_follow() {
         let env = TestEnv::new("ctrlc-workspace-follow");
         let demo = env.create_workspace("demo");
 
@@ -1018,6 +1115,9 @@ workspaces:
             pid_exists(backend_pid),
             "backend should be running before Ctrl+C"
         );
+        let managed_root_pids =
+            current_process_pids(&env).expect("managed pids should exist before Ctrl+C");
+        let tracked_tree = snapshot_process_tree(&managed_root_pids);
 
         session.send_sigint();
         let exit = session.wait_for_exit(Duration::from_secs(8));
@@ -1036,10 +1136,11 @@ workspaces:
             wait_until(Duration::from_secs(5), || !pid_exists(backend_pid)),
             "backend process should be terminated by Ctrl+C-triggered down"
         );
+        assert_no_zombies_for_tree(&tracked_tree, Duration::from_secs(3));
     }
 
     #[test]
-    fn ctrl_c_during_logs_follow_stops_workspace_before_exit() {
+    fn ctrlc_stops_before_exit_when_logs_follow() {
         let env = TestEnv::new("ctrlc-logs-follow");
         let demo = env.create_workspace("demo");
 
@@ -1077,6 +1178,9 @@ workspaces:
             pid_exists(backend_pid),
             "backend should keep running for logs test"
         );
+        let managed_root_pids =
+            current_process_pids(&env).expect("managed pids should exist before logs follow");
+        let tracked_tree = snapshot_process_tree(&managed_root_pids);
 
         let mut logs_session = env.spawn_with_pty(&["logs", "backend"], &[]);
         assert!(
@@ -1101,10 +1205,11 @@ workspaces:
             wait_until(Duration::from_secs(5), || !pid_exists(backend_pid)),
             "backend process should be terminated after logs follow interrupt"
         );
+        assert_no_zombies_for_tree(&tracked_tree, Duration::from_secs(3));
     }
 
     #[test]
-    fn multi_process_workspace_status_and_logs_targets_work() {
+    fn status_and_logs_work_when_multi_process() {
         let env = TestEnv::new("multi-process");
         let demo = env.create_workspace("demo");
 
@@ -1513,6 +1618,12 @@ workspaces:
             pid_exists(child_pid),
             "background child process should be running before down"
         );
+        let managed_root_pids =
+            current_process_pids(&env).expect("managed pids should exist before down");
+        let mut tracked_tree = snapshot_process_tree(&managed_root_pids);
+        tracked_tree.push(child_pid);
+        tracked_tree.sort_unstable();
+        tracked_tree.dedup();
 
         let down = env.run(&["down"]);
         assert_success(&down);
@@ -1520,10 +1631,11 @@ workspaces:
             wait_until(Duration::from_secs(3), || !pid_exists(child_pid)),
             "background child process should be terminated by down"
         );
+        assert_no_zombies_for_tree(&tracked_tree, Duration::from_secs(3));
     }
 
     #[test]
-    fn switch_stops_previous_workspace_processes() {
+    fn switch_stops_previous_workspace() {
         let env = TestEnv::new("switch-stops-previous");
         let alpha = env.create_workspace("alpha");
         let beta = env.create_workspace("beta");
@@ -1571,6 +1683,12 @@ workspaces:
             pid_exists(child_pid),
             "alpha child process should be running before switching to beta"
         );
+        let managed_root_pids =
+            current_process_pids(&env).expect("alpha pids should exist before switching");
+        let mut tracked_tree = snapshot_process_tree(&managed_root_pids);
+        tracked_tree.push(child_pid);
+        tracked_tree.sort_unstable();
+        tracked_tree.dedup();
 
         let switch_beta = env.run(&["beta"]);
         assert_success(&switch_beta);
@@ -1578,6 +1696,7 @@ workspaces:
             wait_until(Duration::from_secs(3), || !pid_exists(child_pid)),
             "switch should stop previous workspace background child process"
         );
+        assert_no_zombies_for_tree(&tracked_tree, Duration::from_secs(3));
     }
 
     #[test]
@@ -1585,6 +1704,7 @@ workspaces:
         let env = TestEnv::new("exec");
         let demo = env.create_workspace("demo");
         let marker = demo.join("exec-result.txt");
+        let cwd_marker = demo.join("cwd.txt");
 
         fs::write(demo.join(".env"), "WSX_EXEC_MARK=from-dotenv\n").expect("failed to write .env");
 
@@ -1616,35 +1736,9 @@ workspaces:
 
         let marker_content = fs::read_to_string(marker).expect("exec marker should be created");
         assert_eq!(marker_content, "from-dotenv");
-    }
 
-    #[test]
-    fn exec_runs_in_workspace_cwd() {
-        let env = TestEnv::new("exec-cwd");
-        let demo = env.create_workspace("demo");
-        let cwd_marker = demo.join("cwd.txt");
-
-        env.write_config(&format!(
-            r#"defaults:
-  env:
-    dotenv: [.env]
-    envrc: false
-workspaces:
-  demo:
-    path: {}
-    processes:
-      - name: app
-        cmd: ["sh", "-lc", "echo boot; sleep 1"]
-"#,
-            yaml_path(&demo),
-        ));
-
-        let switch = env.run(&["demo"]);
-        assert_success(&switch);
-
-        let exec = env.run(&["exec", "sh", "-c", "pwd > cwd.txt"]);
-        assert_success(&exec);
-
+        let exec_cwd = env.run(&["exec", "sh", "-c", "pwd > cwd.txt"]);
+        assert_success(&exec_cwd);
         let cwd = fs::read_to_string(cwd_marker).expect("cwd marker should be created");
         assert_eq!(cwd.trim(), demo.to_string_lossy());
     }
