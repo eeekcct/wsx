@@ -5,6 +5,7 @@ mod linux_e2e {
     use nix::sys::termios::{Termios, tcgetattr};
     use nix::unistd::Pid;
     use serde::Deserialize;
+    use std::collections::{HashMap, HashSet};
     use std::fs::{self, File};
     use std::io::Write;
     use std::os::fd::AsFd;
@@ -359,6 +360,22 @@ mod linux_e2e {
             .map(|entry| entry.pid)
     }
 
+    fn current_process_pids(env: &TestEnv) -> Option<Vec<u32>> {
+        let instance_id = current_instance_id(env)?;
+        let pids_path = env
+            .wsx_home()
+            .join("instances")
+            .join(instance_id)
+            .join("pids.json");
+        if !pids_path.exists() {
+            return None;
+        }
+
+        let raw = fs::read_to_string(pids_path).expect("failed to read pids.json");
+        let meta: PidsMeta = serde_json::from_str(&raw).expect("invalid pids.json");
+        Some(meta.entries.iter().map(|entry| entry.pid).collect())
+    }
+
     fn wait_for_current_status(env: &TestEnv, expected: &str, timeout: Duration) -> bool {
         wait_until(timeout, || {
             current_meta(env).is_some_and(|meta| meta.status.as_deref() == Some(expected))
@@ -378,6 +395,142 @@ mod linux_e2e {
 
     fn pid_exists(pid: u32) -> bool {
         Path::new("/proc").join(pid.to_string()).exists()
+    }
+
+    fn read_proc_state(pid: u32) -> Option<char> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let close_paren = stat.rfind(')')?;
+        stat.get(close_paren + 2..)?.chars().next()
+    }
+
+    fn proc_ppid_map() -> HashMap<u32, u32> {
+        let mut out = HashMap::new();
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return out;
+        };
+
+        for entry in entries.flatten() {
+            let pid = entry.file_name().to_string_lossy().parse::<u32>().ok();
+            let Some(pid) = pid else {
+                continue;
+            };
+
+            let status_path = entry.path().join("status");
+            let Ok(status) = fs::read_to_string(status_path) else {
+                continue;
+            };
+            let ppid = status
+                .lines()
+                .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<u32>().ok());
+            if let Some(ppid) = ppid {
+                out.insert(pid, ppid);
+            }
+        }
+
+        out
+    }
+
+    fn read_proc_cmdline(pid: u32) -> Option<String> {
+        let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        if raw.is_empty() {
+            return None;
+        }
+
+        let args = raw
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>();
+        if args.is_empty() {
+            None
+        } else {
+            Some(args.join(" "))
+        }
+    }
+
+    fn collect_descendants(root_pid: u32) -> Vec<u32> {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (pid, ppid) in proc_ppid_map() {
+            children.entry(ppid).or_default().push(pid);
+        }
+
+        let mut descendants = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![root_pid];
+
+        while let Some(pid) = stack.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+
+            if let Some(child_pids) = children.get(&pid) {
+                for child_pid in child_pids {
+                    descendants.push(*child_pid);
+                    stack.push(*child_pid);
+                }
+            }
+        }
+
+        descendants.sort_unstable();
+        descendants.dedup();
+        descendants
+    }
+
+    fn snapshot_process_tree(root_pids: &[u32]) -> Vec<u32> {
+        let mut tracked = HashSet::new();
+        for root_pid in root_pids {
+            tracked.insert(*root_pid);
+            for descendant in collect_descendants(*root_pid) {
+                tracked.insert(descendant);
+            }
+        }
+
+        let mut out = tracked.into_iter().collect::<Vec<_>>();
+        out.sort_unstable();
+        out
+    }
+
+    fn zombie_details(tracked_pids: &[u32]) -> Vec<String> {
+        let ppid_map = proc_ppid_map();
+        tracked_pids
+            .iter()
+            .filter_map(|pid| {
+                let state = read_proc_state(*pid)?;
+                if state != 'Z' {
+                    return None;
+                }
+
+                let ppid = ppid_map
+                    .get(pid)
+                    .map(u32::to_string)
+                    .unwrap_or_else(|| "?".to_string());
+                let cmdline =
+                    read_proc_cmdline(*pid).unwrap_or_else(|| "<unavailable>".to_string());
+                Some(format!(
+                    "pid={pid} ppid={ppid} state={state} cmdline={cmdline}"
+                ))
+            })
+            .collect()
+    }
+
+    fn assert_no_zombies_for_tree(tracked_pids: &[u32], timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let zombies = zombie_details(tracked_pids);
+            if zombies.is_empty() {
+                return;
+            }
+
+            if Instant::now() >= deadline {
+                panic!(
+                    "zombie processes remained after {:?}:\n{}",
+                    timeout,
+                    zombies.join("\n")
+                );
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]
@@ -1018,6 +1171,9 @@ workspaces:
             pid_exists(backend_pid),
             "backend should be running before Ctrl+C"
         );
+        let managed_root_pids =
+            current_process_pids(&env).expect("managed pids should exist before Ctrl+C");
+        let tracked_tree = snapshot_process_tree(&managed_root_pids);
 
         session.send_sigint();
         let exit = session.wait_for_exit(Duration::from_secs(8));
@@ -1036,6 +1192,7 @@ workspaces:
             wait_until(Duration::from_secs(5), || !pid_exists(backend_pid)),
             "backend process should be terminated by Ctrl+C-triggered down"
         );
+        assert_no_zombies_for_tree(&tracked_tree, Duration::from_secs(3));
     }
 
     #[test]
@@ -1077,6 +1234,9 @@ workspaces:
             pid_exists(backend_pid),
             "backend should keep running for logs test"
         );
+        let managed_root_pids =
+            current_process_pids(&env).expect("managed pids should exist before logs follow");
+        let tracked_tree = snapshot_process_tree(&managed_root_pids);
 
         let mut logs_session = env.spawn_with_pty(&["logs", "backend"], &[]);
         assert!(
@@ -1101,6 +1261,7 @@ workspaces:
             wait_until(Duration::from_secs(5), || !pid_exists(backend_pid)),
             "backend process should be terminated after logs follow interrupt"
         );
+        assert_no_zombies_for_tree(&tracked_tree, Duration::from_secs(3));
     }
 
     #[test]
@@ -1513,6 +1674,12 @@ workspaces:
             pid_exists(child_pid),
             "background child process should be running before down"
         );
+        let managed_root_pids =
+            current_process_pids(&env).expect("managed pids should exist before down");
+        let mut tracked_tree = snapshot_process_tree(&managed_root_pids);
+        tracked_tree.push(child_pid);
+        tracked_tree.sort_unstable();
+        tracked_tree.dedup();
 
         let down = env.run(&["down"]);
         assert_success(&down);
@@ -1520,6 +1687,7 @@ workspaces:
             wait_until(Duration::from_secs(3), || !pid_exists(child_pid)),
             "background child process should be terminated by down"
         );
+        assert_no_zombies_for_tree(&tracked_tree, Duration::from_secs(3));
     }
 
     #[test]
@@ -1571,6 +1739,12 @@ workspaces:
             pid_exists(child_pid),
             "alpha child process should be running before switching to beta"
         );
+        let managed_root_pids =
+            current_process_pids(&env).expect("alpha pids should exist before switching");
+        let mut tracked_tree = snapshot_process_tree(&managed_root_pids);
+        tracked_tree.push(child_pid);
+        tracked_tree.sort_unstable();
+        tracked_tree.dedup();
 
         let switch_beta = env.run(&["beta"]);
         assert_success(&switch_beta);
@@ -1578,6 +1752,7 @@ workspaces:
             wait_until(Duration::from_secs(3), || !pid_exists(child_pid)),
             "switch should stop previous workspace background child process"
         );
+        assert_no_zombies_for_tree(&tracked_tree, Duration::from_secs(3));
     }
 
     #[test]
