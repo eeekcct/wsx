@@ -1,6 +1,4 @@
 use anyhow::{Context, Result, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use signal_hook::SigId;
 use signal_hook::consts::signal::SIGINT;
 use signal_hook::{flag, low_level};
@@ -9,6 +7,7 @@ use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -36,21 +35,6 @@ pub enum FollowOutcome {
     Completed,
     Detached,
     Interrupted,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InputEvent {
-    Detach,
-    Interrupt,
-}
-
-impl InputEvent {
-    fn into_follow_outcome(self) -> FollowOutcome {
-        match self {
-            InputEvent::Detach => FollowOutcome::Detached,
-            InputEvent::Interrupt => FollowOutcome::Interrupted,
-        }
-    }
 }
 
 pub fn show_logs(
@@ -86,7 +70,7 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<FollowO
         return Ok(FollowOutcome::Completed);
     }
 
-    let mut control = FollowControl::new()?;
+    let control = FollowControl::new()?;
     let mut out_pos = file_len(&out)?;
     let mut err_pos = file_len(&err)?;
     let mut combined_pos = file_len(&combined)?;
@@ -147,7 +131,7 @@ fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<Follow
         return Ok(FollowOutcome::Completed);
     }
 
-    let mut control = FollowControl::new()?;
+    let control = FollowControl::new()?;
     let mut pos = file_len(path)?;
     let mut sleep_backoff = BACKOFF_MIN_MS;
     loop {
@@ -296,86 +280,27 @@ fn next_backoff_ms(current: u64, had_delta: bool) -> u64 {
 
 struct FollowControl {
     signal: SignalGuard,
-    input: Option<InputControl>,
+    detach_rx: Option<Receiver<()>>,
 }
 
 impl FollowControl {
     fn new() -> Result<Self> {
         Ok(Self {
             signal: SignalGuard::register()?,
-            input: InputControl::new()?,
+            detach_rx: spawn_detach_listener(),
         })
     }
 
-    fn poll(&mut self) -> Result<Option<FollowOutcome>> {
+    fn poll(&self) -> Result<Option<FollowOutcome>> {
         if self.signal.interrupted() {
             return Ok(Some(FollowOutcome::Interrupted));
         }
 
-        if let Some(input) = &mut self.input
-            && let Some(event) = input.poll()?
-        {
-            return Ok(Some(event.into_follow_outcome()));
+        if should_detach(&self.detach_rx) {
+            return Ok(Some(FollowOutcome::Detached));
         }
 
         Ok(None)
-    }
-}
-
-struct InputControl {
-    _raw_mode: RawModeGuard,
-    awaiting_detach_confirm: bool,
-}
-
-impl InputControl {
-    fn new() -> Result<Option<Self>> {
-        if !std::io::stdin().is_terminal() {
-            return Ok(None);
-        }
-
-        eprintln!("[wsx] following logs (press q + Enter to detach, Ctrl+C to stop workspace)");
-        let raw_mode = RawModeGuard::new()?;
-
-        Ok(Some(Self {
-            _raw_mode: raw_mode,
-            awaiting_detach_confirm: false,
-        }))
-    }
-
-    fn poll(&mut self) -> Result<Option<InputEvent>> {
-        while event::poll(Duration::from_millis(0)).context("failed to poll terminal input")? {
-            let event = event::read().context("failed to read terminal input")?;
-            let Event::Key(key_event) = event else {
-                continue;
-            };
-
-            if let Some(input_event) =
-                parse_input_event(key_event, &mut self.awaiting_detach_confirm)
-            {
-                return Ok(Some(input_event));
-            }
-        }
-
-        Ok(None)
-    }
-}
-
-struct RawModeGuard {
-    enabled: bool,
-}
-
-impl RawModeGuard {
-    fn new() -> Result<Self> {
-        enable_raw_mode().context("failed to enable terminal raw mode")?;
-        Ok(Self { enabled: true })
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        if self.enabled {
-            let _ = disable_raw_mode();
-        }
     }
 }
 
@@ -406,79 +331,40 @@ impl Drop for SignalGuard {
     }
 }
 
-fn parse_input_event(
-    key_event: KeyEvent,
-    awaiting_detach_confirm: &mut bool,
-) -> Option<InputEvent> {
-    if !matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+fn spawn_detach_listener() -> Option<Receiver<()>> {
+    if !std::io::stdin().is_terminal() {
         return None;
     }
 
-    if is_ctrl_c_event(&key_event) {
-        *awaiting_detach_confirm = false;
-        return Some(InputEvent::Interrupt);
-    }
+    eprintln!("[wsx] following logs (press q + Enter to detach, Ctrl+C to stop workspace)");
 
-    if *awaiting_detach_confirm {
-        if is_enter_key(&key_event) {
-            *awaiting_detach_confirm = false;
-            return Some(InputEvent::Detach);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        loop {
+            let mut line = String::new();
+            if stdin.read_line(&mut line).is_err() {
+                break;
+            }
+            if line.trim().eq_ignore_ascii_case("q") {
+                let _ = tx.send(());
+                break;
+            }
         }
+    });
 
-        if is_q_key(&key_event) {
-            return None;
-        }
-
-        *awaiting_detach_confirm = false;
-        return None;
-    }
-
-    if is_q_key(&key_event) {
-        *awaiting_detach_confirm = true;
-    }
-
-    None
+    Some(rx)
 }
 
-fn is_ctrl_c_event(key_event: &KeyEvent) -> bool {
-    if key_event.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key_event.code, KeyCode::Char('c') | KeyCode::Char('C'))
-    {
-        return true;
+fn should_detach(detach_rx: &Option<Receiver<()>>) -> bool {
+    match detach_rx {
+        None => false,
+        Some(rx) => match rx.try_recv() {
+            Ok(_) => true,
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => false,
+        },
     }
-
-    // Some Windows terminals in raw mode emit Ctrl+C as ETX without CONTROL modifier.
-    matches!(key_event.code, KeyCode::Char('\u{3}'))
-}
-
-fn is_q_key(key_event: &KeyEvent) -> bool {
-    if !matches!(
-        key_event.modifiers,
-        KeyModifiers::NONE | KeyModifiers::SHIFT
-    ) {
-        return false;
-    }
-
-    matches!(key_event.code, KeyCode::Char('q') | KeyCode::Char('Q'))
-}
-
-fn is_enter_key(key_event: &KeyEvent) -> bool {
-    if matches!(key_event.modifiers, KeyModifiers::NONE) {
-        return matches!(
-            key_event.code,
-            KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r')
-        );
-    }
-
-    if key_event.modifiers == KeyModifiers::CONTROL {
-        // PTY input can represent Enter/newline as Ctrl+M (CR) or Ctrl+J (LF).
-        return matches!(
-            key_event.code,
-            KeyCode::Char('m') | KeyCode::Char('M') | KeyCode::Char('j') | KeyCode::Char('J')
-        );
-    }
-
-    false
 }
 
 fn is_pid_running(pid: u32) -> bool {
@@ -488,7 +374,6 @@ fn is_pid_running(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn parses_target_formats() {
@@ -524,156 +409,5 @@ mod tests {
     fn backoff_resets_on_delta() {
         let ms = next_backoff_ms(800, true);
         assert_eq!(ms, BACKOFF_MIN_MS);
-    }
-
-    #[test]
-    fn input_state_machine_detaches_on_q_then_enter() {
-        let mut awaiting_detach_confirm = false;
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-                &mut awaiting_detach_confirm
-            ),
-            None
-        );
-        assert!(awaiting_detach_confirm);
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                &mut awaiting_detach_confirm
-            ),
-            Some(InputEvent::Detach)
-        );
-        assert!(!awaiting_detach_confirm);
-    }
-
-    #[test]
-    fn input_state_machine_detaches_on_q_then_newline_char() {
-        let mut awaiting_detach_confirm = false;
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-                &mut awaiting_detach_confirm
-            ),
-            None
-        );
-        assert!(awaiting_detach_confirm);
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE),
-                &mut awaiting_detach_confirm
-            ),
-            Some(InputEvent::Detach)
-        );
-        assert!(!awaiting_detach_confirm);
-    }
-
-    #[test]
-    fn input_state_machine_detaches_on_q_then_ctrl_m() {
-        let mut awaiting_detach_confirm = false;
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-                &mut awaiting_detach_confirm
-            ),
-            None
-        );
-        assert!(awaiting_detach_confirm);
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
-                &mut awaiting_detach_confirm
-            ),
-            Some(InputEvent::Detach)
-        );
-        assert!(!awaiting_detach_confirm);
-    }
-
-    #[test]
-    fn input_state_machine_detaches_on_q_then_ctrl_j() {
-        let mut awaiting_detach_confirm = false;
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-                &mut awaiting_detach_confirm
-            ),
-            None
-        );
-        assert!(awaiting_detach_confirm);
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
-                &mut awaiting_detach_confirm
-            ),
-            Some(InputEvent::Detach)
-        );
-        assert!(!awaiting_detach_confirm);
-    }
-
-    #[test]
-    fn input_state_machine_interrupts_immediately_on_ctrl_c() {
-        let mut awaiting_detach_confirm = true;
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                &mut awaiting_detach_confirm
-            ),
-            Some(InputEvent::Interrupt)
-        );
-        assert!(!awaiting_detach_confirm);
-    }
-
-    #[test]
-    fn input_state_machine_interrupts_on_ctrl_c_etx_char() {
-        let mut awaiting_detach_confirm = true;
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE),
-                &mut awaiting_detach_confirm
-            ),
-            Some(InputEvent::Interrupt)
-        );
-        assert!(!awaiting_detach_confirm);
-    }
-
-    #[test]
-    fn input_state_machine_cancels_q_on_other_key() {
-        let mut awaiting_detach_confirm = false;
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-                &mut awaiting_detach_confirm
-            ),
-            None
-        );
-        assert!(awaiting_detach_confirm);
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
-                &mut awaiting_detach_confirm
-            ),
-            None
-        );
-        assert!(!awaiting_detach_confirm);
-
-        assert_eq!(
-            parse_input_event(
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                &mut awaiting_detach_confirm
-            ),
-            None
-        );
     }
 }
