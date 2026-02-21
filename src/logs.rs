@@ -414,9 +414,7 @@ fn parse_input_event(
         return None;
     }
 
-    if key_event.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key_event.code, KeyCode::Char('c') | KeyCode::Char('C'))
-    {
+    if is_ctrl_c_event(&key_event) {
         *awaiting_detach_confirm = false;
         return Some(InputEvent::Interrupt);
     }
@@ -440,6 +438,17 @@ fn parse_input_event(
     }
 
     None
+}
+
+fn is_ctrl_c_event(key_event: &KeyEvent) -> bool {
+    if key_event.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key_event.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        return true;
+    }
+
+    // Some Windows terminals in raw mode emit Ctrl+C as ETX without CONTROL modifier.
+    matches!(key_event.code, KeyCode::Char('\u{3}'))
 }
 
 fn is_q_key(key_event: &KeyEvent) -> bool {
@@ -616,6 +625,20 @@ mod tests {
         assert_eq!(
             parse_input_event(
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut awaiting_detach_confirm
+            ),
+            Some(InputEvent::Interrupt)
+        );
+        assert!(!awaiting_detach_confirm);
+    }
+
+    #[test]
+    fn input_state_machine_interrupts_on_ctrl_c_etx_char() {
+        let mut awaiting_detach_confirm = true;
+
+        assert_eq!(
+            parse_input_event(
+                KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE),
                 &mut awaiting_detach_confirm
             ),
             Some(InputEvent::Interrupt)

@@ -45,6 +45,7 @@ Start the current workspace when it is in `stopped` state.
 Stop the current running workspace.
 
 - Sends graceful stop first, then force stop if needed.
+- On Windows, graceful stop uses `taskkill`, and force stop uses Windows Job Object termination.
 - If processes still remain after stop attempts, command fails.
 - Keeps `current.json` and sets current state to `stopped` on success.
 
@@ -91,4 +92,7 @@ Show runtime status.
 ## Notes
 
 - `wsx` state is stored under `~/.config/wsx`.
+- On Windows, if the current instance was started by an older `wsx` that did not persist
+  job tracking metadata, `wsx down` can fail during force stop. Start a new instance with
+  the current version to enable job-based force stop.
 - Configuration reference is in `docs/CONFIG.md`.
