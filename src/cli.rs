@@ -55,6 +55,10 @@ pub enum Command {
         cmd: Vec<String>,
     },
     Status,
+    Select {
+        #[arg(value_name = "target")]
+        target: String,
+    },
 }
 
 pub fn run() -> Result<()> {

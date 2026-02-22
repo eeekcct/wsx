@@ -30,9 +30,26 @@ pub fn run(cli: Cli) -> Result<()> {
         ) => logs_current(target, lines, !no_follow),
         (None, Some(Command::Exec { cmd })) => exec_current(cmd),
         (None, Some(Command::Status)) => status_current(),
+        (None, Some(Command::Select { target })) => select_workspace(&target),
         (None, None) => bail!("workspace or subcommand is required"),
         (Some(_), Some(_)) => bail!("workspace argument and subcommand cannot be used together"),
     }
+}
+
+fn select_workspace(target: &str) -> Result<()> {
+    paths::ensure_home_layout()?;
+    let config = Config::load()?;
+    let workspace = config.resolve_workspace(target)?;
+    down_current(Some(&config))?;
+
+    state::save_current(&CurrentState {
+        workspace: workspace.name.clone(),
+        instance_id: None,
+        started_at: Utc::now(),
+        status: CurrentStatus::Stopped,
+    })?;
+    println!("selected workspace `{}`", workspace.name);
+    Ok(())
 }
 
 fn switch_workspace(workspace_name: &str) -> Result<()> {
@@ -69,7 +86,7 @@ fn start_workspace_instance(workspace: &ResolvedWorkspace, action: &str) -> Resu
     state::save_pids(&pids)?;
     state::save_current(&CurrentState {
         workspace: workspace.name.clone(),
-        instance_id,
+        instance_id: Some(instance_id),
         started_at: Utc::now(),
         status: CurrentStatus::Running,
     })?;
@@ -127,23 +144,22 @@ fn down_current(config: Option<&Config>) -> Result<()> {
         return Ok(());
     }
 
-    let pids_file = state::load_pids(&current.instance_id).with_context(|| {
-        format!(
-            "pids file for instance `{}` could not be read",
-            current.instance_id
-        )
-    })?;
+    let Some(instance_id) = current.instance_id.as_deref() else {
+        println!("workspace `{}` has no running instance", current.workspace);
+        current.status = CurrentStatus::Stopped;
+        state::save_current(&current)?;
+        return Ok(());
+    };
+
+    let pids_file = state::load_pids(instance_id)
+        .with_context(|| format!("pids file for instance `{}` could not be read", instance_id))?;
 
     let grace_seconds = resolve_grace_seconds(config, &current.workspace);
     process::stop_workspace(&pids_file, grace_seconds)?;
     current.status = CurrentStatus::Stopped;
     state::save_current(&current)?;
     let keep_instances = resolve_keep_instances(config, &current.workspace);
-    cleanup_workspace_instances(
-        &current.workspace,
-        keep_instances,
-        Some(&current.instance_id),
-    )?;
+    cleanup_workspace_instances(&current.workspace, keep_instances, Some(instance_id))?;
 
     println!("stopped workspace `{}`", current.workspace);
 
@@ -152,7 +168,11 @@ fn down_current(config: Option<&Config>) -> Result<()> {
 
 fn logs_current(target: Option<String>, lines: Option<usize>, follow: bool) -> Result<()> {
     let current = load_current_reconciled()?.context("no current workspace")?;
-    let pids = state::load_pids(&current.instance_id)?;
+    let Some(instance_id) = current.instance_id.as_deref() else {
+        println!("no running instance");
+        return Ok(());
+    };
+    let pids = state::load_pids(instance_id)?;
 
     let (default_target, default_lines) = resolve_log_defaults(&current.workspace, &pids);
 
@@ -206,7 +226,10 @@ fn exec_current(cmd: Vec<String>) -> Result<()> {
 fn print_current_overview(current: &CurrentState) {
     println!("Current workspace: {}", current.workspace);
     println!("State: {}", current.status.as_str());
-    println!("Instance ID: {}", current.instance_id);
+    println!(
+        "Instance ID: {}",
+        current.instance_id.as_deref().unwrap_or("(none)")
+    );
     println!("Started at: {}", current.started_at);
 }
 
@@ -247,7 +270,11 @@ fn status_current() -> Result<()> {
     };
 
     print_current_overview(&current);
-    print_process_overview(&current.instance_id)
+    let Some(instance_id) = current.instance_id.as_deref() else {
+        println!("Processes: unavailable (no running instance)");
+        return Ok(());
+    };
+    print_process_overview(instance_id)
 }
 
 fn load_current_reconciled() -> Result<Option<CurrentState>> {
@@ -259,7 +286,13 @@ fn load_current_reconciled() -> Result<Option<CurrentState>> {
         return Ok(Some(current));
     }
 
-    let pids = match state::load_pids(&current.instance_id) {
+    let Some(instance_id) = current.instance_id.clone() else {
+        current.status = CurrentStatus::Stopped;
+        state::save_current(&current)?;
+        return Ok(Some(current));
+    };
+
+    let pids = match state::load_pids(&instance_id) {
         Ok(pids) => pids,
         Err(_) => return Ok(Some(current)),
     };
