@@ -28,7 +28,8 @@ fn default_current_status() -> CurrentStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentState {
     pub workspace: String,
-    pub instance_id: String,
+    #[serde(default)]
+    pub instance_id: Option<String>,
     pub started_at: DateTime<Utc>,
     #[serde(default = "default_current_status")]
     pub status: CurrentStatus,
@@ -136,5 +137,13 @@ mod tests {
             r#"{"workspace":"deva","instance_id":"inst","started_at":"2025-01-01T00:00:00Z"}"#;
         let current: CurrentState = serde_json::from_str(raw).expect("deserialize current");
         assert_eq!(current.status, CurrentStatus::Running);
+        assert_eq!(current.instance_id.as_deref(), Some("inst"));
+    }
+
+    #[test]
+    fn current_instance_id_defaults_to_none_when_missing() {
+        let raw = r#"{"workspace":"deva","started_at":"2025-01-01T00:00:00Z","status":"stopped"}"#;
+        let current: CurrentState = serde_json::from_str(raw).expect("deserialize current");
+        assert_eq!(current.instance_id, None);
     }
 }

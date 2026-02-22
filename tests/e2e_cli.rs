@@ -279,7 +279,7 @@ mod linux_e2e {
 
     #[derive(Debug, Deserialize)]
     struct CurrentMeta {
-        instance_id: String,
+        instance_id: Option<String>,
         status: Option<String>,
     }
 
@@ -327,7 +327,7 @@ mod linux_e2e {
 
         let raw = fs::read_to_string(current_path).expect("failed to read current.json");
         let current: CurrentMeta = serde_json::from_str(&raw).expect("invalid current.json");
-        Some(current.instance_id)
+        current.instance_id
     }
 
     fn current_meta(env: &TestEnv) -> Option<CurrentMeta> {
@@ -621,6 +621,144 @@ workspaces:
     }
 
     #[test]
+    fn select_sets_stopped_without_starting_processes() {
+        let env = TestEnv::new("select-stopped-no-start");
+        let demo = env.create_workspace("demo");
+        let marker = demo.join("started.txt");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo started > started.txt; sleep 60"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let select = env.run(&["select", "demo"]);
+        assert_success(&select);
+        assert_stdout_contains_all(&select, &["selected workspace `demo`"]);
+        assert!(
+            !marker.exists(),
+            "select should not start workspace processes"
+        );
+
+        let meta = current_meta(&env).expect("current should exist after select");
+        assert_eq!(meta.status.as_deref(), Some("stopped"));
+        assert_eq!(meta.instance_id, None);
+
+        let status = env.run(&["status"]);
+        assert_success(&status);
+        assert_stdout_contains_all(
+            &status,
+            &[
+                "Current workspace: demo",
+                "State: stopped",
+                "Instance ID: (none)",
+                "Processes: unavailable (no running instance)",
+            ],
+        );
+    }
+
+    #[test]
+    fn logs_after_select_succeeds_with_no_running_instance_message() {
+        let env = TestEnv::new("logs-after-select");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo demo; sleep 60"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let select = env.run(&["select", "demo"]);
+        assert_success(&select);
+
+        let logs = env.run(&["logs", "--no-follow"]);
+        assert_success(&logs);
+        assert_stdout_contains_all(&logs, &["no running instance"]);
+    }
+
+    #[test]
+    fn down_after_select_succeeds() {
+        let env = TestEnv::new("down-after-select");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo demo; sleep 60"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let select = env.run(&["select", "demo"]);
+        assert_success(&select);
+
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        assert_down_succeeded_message(&down, "demo");
+    }
+
+    #[test]
+    fn up_after_select_starts_workspace_and_sets_instance_id() {
+        let env = TestEnv::new("up-after-select");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: ["sh", "-lc", "echo demo; sleep 1"]
+"#,
+            yaml_path(&demo),
+        ));
+
+        let select = env.run(&["select", "demo"]);
+        assert_success(&select);
+
+        let up = env.run(&["up"]);
+        assert_success(&up);
+        assert_stdout_contains_all(&up, &["started workspace `demo`"]);
+
+        let meta = current_meta(&env).expect("current should exist after up");
+        assert!(
+            meta.instance_id.is_some(),
+            "up should set instance_id after select"
+        );
+    }
+
+    #[test]
     fn config_missing_file_returns_error() {
         let env = TestEnv::new("config-missing");
         let list = env.run(&["list"]);
@@ -757,7 +895,8 @@ workspaces:
         let meta_after_up = current_meta(&env).expect("current should exist after up");
         assert_eq!(meta_after_up.status.as_deref(), Some("running"));
         assert_ne!(
-            meta_after_up.instance_id, first_instance,
+            meta_after_up.instance_id.as_deref(),
+            Some(first_instance.as_str()),
             "up should create a new instance id"
         );
     }
@@ -875,7 +1014,8 @@ workspaces:
 
         let meta_after_up = current_meta(&env).expect("current should exist after up");
         assert_ne!(
-            meta_after_up.instance_id, first_instance,
+            meta_after_up.instance_id.as_deref(),
+            Some(first_instance.as_str()),
             "up should create a new instance id when previous processes are stopped"
         );
     }
@@ -1574,7 +1714,7 @@ workspaces:
         assert_failure(&switch);
         assert_stderr_contains(&switch, ".envrc execution failed");
         assert!(
-            current_instance_id(&env).is_none(),
+            current_meta(&env).is_none(),
             "current should not be saved when envrc evaluation fails"
         );
     }
