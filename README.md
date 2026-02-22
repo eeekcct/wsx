@@ -10,7 +10,7 @@ It is not production-ready yet, and some commands may fail depending on environm
 
 ## Features
 
-- Switch workspaces and manage grouped process lifecycle (`wsx <workspace>`, `wsx up`, `wsx down`)
+- Switch workspaces and manage grouped process lifecycle (`wsx <workspace>`, `wsx select <workspace>`, `wsx up`, `wsx down`)
 - Run commands in current workspace context (`wsx exec <cmd...>`)
 - Layer environment resolution: OS -> dotenv -> envrc
 - Inspect and follow logs by process/stream with detach support (`wsx logs`, `--no-follow`, `q` + Enter)

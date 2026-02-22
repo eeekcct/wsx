@@ -6,6 +6,7 @@ This document describes CLI usage for the current implementation.
 
 ```text
 wsx <workspace>
+wsx select <workspace>
 wsx list
 wsx up
 wsx down
@@ -25,6 +26,14 @@ Switch to a workspace.
 - Saves runtime metadata to `~/.config/wsx/current.json` and `instances/<id>/pids.json`.
 - Starts log follow for the configured default log target.
 - During log follow, press `q` then Enter to detach without stopping processes.
+
+### `wsx select <workspace>`
+
+Select a workspace without starting processes.
+
+- Stops the current running workspace first.
+- Updates `current.json` to the selected workspace with `stopped` status.
+- Does not create a new runtime instance or `pids.json`.
 
 ### `wsx list`
 
@@ -48,6 +57,7 @@ Stop the current running workspace.
 - On Windows, graceful stop uses `taskkill`, and force stop uses Windows Job Object termination.
 - If processes still remain after stop attempts, command fails.
 - Keeps `current.json` and sets current state to `stopped` on success.
+- If there is no running instance, prints a notice and exits successfully.
 
 ### `wsx logs [target] [--lines <n>] [--no-follow]`
 
@@ -59,6 +69,7 @@ Show logs for current workspace.
   - `<process>:err`
 - `--lines <n>` controls initial tail size.
 - `--no-follow` prints initial tail and exits immediately.
+- If the current workspace has no running instance, prints a notice and exits successfully.
 - Without `--no-follow`, logs are followed:
   - press `q` then Enter to detach
   - press `Ctrl+C` to stop the current workspace before exiting
@@ -86,7 +97,7 @@ Show runtime status.
 
 - Current workspace name
 - Current state (`running` or `stopped`)
-- Current instance id and start time
+- Current instance id (`(none)` when no running instance) and start time
 - Per-process pid and `running`/`stopped`
 
 ## Notes
