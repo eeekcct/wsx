@@ -1714,7 +1714,7 @@ workspaces:
         assert_failure(&switch);
         assert_stderr_contains(&switch, ".envrc execution failed");
         assert!(
-            current_instance_id(&env).is_none(),
+            current_meta(&env).is_none(),
             "current should not be saved when envrc evaluation fails"
         );
     }
