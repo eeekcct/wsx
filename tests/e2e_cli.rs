@@ -895,7 +895,8 @@ workspaces:
         let meta_after_up = current_meta(&env).expect("current should exist after up");
         assert_eq!(meta_after_up.status.as_deref(), Some("running"));
         assert_ne!(
-            meta_after_up.instance_id, first_instance,
+            meta_after_up.instance_id.as_deref(),
+            Some(first_instance.as_str()),
             "up should create a new instance id"
         );
     }
@@ -1013,7 +1014,8 @@ workspaces:
 
         let meta_after_up = current_meta(&env).expect("current should exist after up");
         assert_ne!(
-            meta_after_up.instance_id, first_instance,
+            meta_after_up.instance_id.as_deref(),
+            Some(first_instance.as_str()),
             "up should create a new instance id when previous processes are stopped"
         );
     }
