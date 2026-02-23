@@ -12,11 +12,11 @@ fn resolve_home_dir() -> Option<PathBuf> {
 
         if let (Some(mut homedrive), Some(homepath)) =
             (env::var_os("HOMEDRIVE"), env::var_os("HOMEPATH"))
+            && !homedrive.is_empty()
+            && !homepath.is_empty()
         {
-            if !homedrive.is_empty() && !homepath.is_empty() {
-                homedrive.push(homepath);
-                return Some(PathBuf::from(homedrive));
-            }
+            homedrive.push(homepath);
+            return Some(PathBuf::from(homedrive));
         }
 
         env::var_os("HOME")

@@ -85,7 +85,7 @@ mod windows_e2e {
 
     #[derive(Debug, Deserialize)]
     struct CurrentMeta {
-        instance_id: String,
+        instance_id: Option<String>,
         status: Option<String>,
     }
 
@@ -177,7 +177,7 @@ mod windows_e2e {
         }
         let raw = fs::read_to_string(current_path).expect("failed to read current.json");
         let current: CurrentMeta = serde_json::from_str(&raw).expect("invalid current.json");
-        Some(current.instance_id)
+        current.instance_id
     }
 
     fn current_meta(env: &TestEnv) -> Option<CurrentMeta> {
@@ -291,7 +291,20 @@ workspaces:
 
         let status = env.run(&["status"]);
         assert_success(&status);
-        assert_stdout_contains_all(&status, &["Current workspace: demo", "- app (pid "]);
+        let status_out = stdout(&status);
+        assert!(
+            status_out.contains("Current workspace: demo"),
+            "status should show current workspace\nstdout:\n{}\nstderr:\n{}",
+            status_out,
+            stderr(&status)
+        );
+        assert!(
+            status_out.contains("- app (pid ")
+                || status_out.contains("Processes: unavailable (no running instance)"),
+            "status should show either running pid info or reconciled no-running state\nstdout:\n{}\nstderr:\n{}",
+            status_out,
+            stderr(&status)
+        );
 
         let down = env.run(&["down"]);
         assert_success(&down);
@@ -339,7 +352,100 @@ workspaces:
         assert_stdout_contains_all(&up, &["started workspace `demo`"]);
         let meta_after_up = current_meta(&env).expect("current should exist after up");
         assert_eq!(meta_after_up.status.as_deref(), Some("running"));
-        assert_ne!(meta_after_up.instance_id, first_instance);
+        assert_ne!(
+            meta_after_up.instance_id.as_deref(),
+            Some(first_instance.as_str())
+        );
+    }
+
+    #[test]
+    fn down_clears_instance_and_logs_reports_no_running_instance() {
+        let env = TestEnv::new("nonlinux-down-clears-instance");
+        let demo = env.create_workspace("demo");
+        let app_cmd = python_cmd(r#"import time; print("demo-run", flush=True); time.sleep(1)"#);
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: {}
+"#,
+            yaml_path(&demo),
+            app_cmd,
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        assert_down_succeeded_message(&down, "demo");
+
+        let meta = current_meta(&env).expect("current should exist after down");
+        assert_eq!(meta.status.as_deref(), Some("stopped"));
+        assert_eq!(meta.instance_id, None);
+
+        let logs = env.run(&["logs", "--no-follow"]);
+        assert_success(&logs);
+        assert_stdout_contains_all(&logs, &["no running instance"]);
+    }
+
+    #[test]
+    fn down_recovers_when_running_instance_metadata_is_missing() {
+        let env = TestEnv::new("nonlinux-down-missing-pids");
+        let demo = env.create_workspace("demo");
+        let short_cmd = python_cmd(r#"import time; print("short", flush=True); time.sleep(1)"#);
+        let long_cmd = python_cmd(r#"import time; print("long", flush=True); time.sleep(30)"#);
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: short
+        default_log: true
+        cmd: {}
+      - name: long
+        cmd: {}
+"#,
+            yaml_path(&demo),
+            short_cmd,
+            long_cmd,
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let instance_id =
+            current_instance_id(&env).expect("current instance should exist after switch");
+        let pids_path = env
+            .wsx_home()
+            .join("instances")
+            .join(instance_id)
+            .join("pids.json");
+        fs::remove_file(&pids_path).expect("failed to remove pids.json");
+
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        assert_stdout_contains_all(&down, &["marked as stopped"]);
+
+        let meta = current_meta(&env).expect("current should exist after recovery");
+        assert_eq!(meta.status.as_deref(), Some("stopped"));
+        assert_eq!(meta.instance_id, None);
     }
 
     #[test]

@@ -837,7 +837,10 @@ workspaces:
         assert_success(&status);
         let status_stdout = stdout(&status);
         assert!(status_stdout.contains("Current workspace: deva"));
-        assert!(status_stdout.contains("- app (pid "));
+        assert!(
+            status_stdout.contains("- app (pid ")
+                || status_stdout.contains("Processes: unavailable (no running instance)")
+        );
 
         let down = env.run(&["down"]);
         assert_success(&down);

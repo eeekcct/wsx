@@ -44,11 +44,21 @@ pub fn show_logs(
     follow: bool,
 ) -> Result<FollowOutcome> {
     let parsed = parse_target(target)?;
+    let available = available_targets(pids_file);
     let entry = pids_file
         .entries
         .iter()
         .find(|entry| entry.name == parsed.process_name)
-        .with_context(|| format!("process `{}` is not running", parsed.process_name))?;
+        .with_context(|| {
+            if available.is_empty() {
+                format!("process `{}` is not running", parsed.process_name)
+            } else {
+                format!(
+                    "process `{}` is not running (available targets: {})",
+                    parsed.process_name, available
+                )
+            }
+        })?;
 
     match parsed.stream {
         StreamKind::Combined => show_combined(entry, lines, follow),
@@ -168,24 +178,48 @@ fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<Follow
 fn parse_target(target: &str) -> Result<ParsedTarget> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
-        bail!("logs target is empty");
+        bail!("logs target is empty (expected <process>, <process>:out, or <process>:err)");
     }
 
     match trimmed.split_once(':') {
-        Some((name, "out")) => Ok(ParsedTarget {
-            process_name: name.trim().to_string(),
-            stream: StreamKind::Out,
-        }),
-        Some((name, "err")) => Ok(ParsedTarget {
-            process_name: name.trim().to_string(),
-            stream: StreamKind::Err,
-        }),
-        Some((_name, stream)) => bail!("invalid logs stream `{stream}` (expected out or err)"),
+        Some((name, "out")) => {
+            let process_name = name.trim();
+            if process_name.is_empty() {
+                bail!("logs target is empty (expected <process>, <process>:out, or <process>:err)");
+            }
+            Ok(ParsedTarget {
+                process_name: process_name.to_string(),
+                stream: StreamKind::Out,
+            })
+        }
+        Some((name, "err")) => {
+            let process_name = name.trim();
+            if process_name.is_empty() {
+                bail!("logs target is empty (expected <process>, <process>:out, or <process>:err)");
+            }
+            Ok(ParsedTarget {
+                process_name: process_name.to_string(),
+                stream: StreamKind::Err,
+            })
+        }
+        Some((_name, stream)) => bail!(
+            "invalid logs stream `{stream}` (expected out or err; target format: <process>, <process>:out, <process>:err)"
+        ),
         None => Ok(ParsedTarget {
             process_name: trimmed.to_string(),
             stream: StreamKind::Combined,
         }),
     }
+}
+
+fn available_targets(pids_file: &PidsFile) -> String {
+    let mut targets = Vec::new();
+    for entry in &pids_file.entries {
+        targets.push(entry.name.clone());
+        targets.push(format!("{}:out", entry.name));
+        targets.push(format!("{}:err", entry.name));
+    }
+    targets.join(", ")
 }
 
 fn rebuild_combined(out: &Path, err: &Path, combined: &Path) -> Result<()> {
@@ -388,6 +422,7 @@ mod tests {
         assert_eq!(err.stream, StreamKind::Err);
 
         assert!(parse_target("backend:unknown").is_err());
+        assert!(parse_target(":out").is_err());
     }
 
     #[test]
