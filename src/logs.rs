@@ -336,7 +336,7 @@ fn spawn_detach_listener() -> Option<Receiver<()>> {
         return None;
     }
 
-    eprintln!("[wsx] following logs (press q + Enter to detach, Ctrl+C to stop workspace)");
+    traxer::info!("following logs (press q + Enter to detach, Ctrl+C to stop workspace)");
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {

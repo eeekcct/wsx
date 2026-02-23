@@ -44,6 +44,10 @@ Detailed command usage is documented in:
 
 - `docs/USAGE.md`
 
+## Logging
+
+- Set `WSX_LOG` to control log level/filter directives (default: `info`).
+
 ## Configuration
 
 Config file location:

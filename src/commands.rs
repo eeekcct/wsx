@@ -49,6 +49,7 @@ fn select_workspace(target: &str) -> Result<()> {
         status: CurrentStatus::Stopped,
     })?;
     println!("selected workspace `{}`", workspace.name);
+    traxer::info!("selected workspace `{}`", workspace.name);
     Ok(())
 }
 
@@ -92,6 +93,7 @@ fn start_workspace_instance(workspace: &ResolvedWorkspace, action: &str) -> Resu
     })?;
 
     println!("{action} workspace `{}`", workspace.name);
+    traxer::info!("{action} workspace `{}`", workspace.name);
     let follow_outcome =
         logs::show_logs(&pids, &workspace.logs_default, workspace.logs_lines, true)?;
     handle_follow_outcome(follow_outcome)?;
@@ -110,7 +112,7 @@ fn list_workspaces() -> Result<()> {
         Ok(Some(current)) => Some(current.workspace),
         Ok(None) => None,
         Err(err) => {
-            eprintln!("warning: current state is invalid, ignoring it: {err:#}");
+            traxer::warn!("current state is invalid, ignoring it: {err:#}");
             None
         }
     };
@@ -128,7 +130,7 @@ fn down_current(config: Option<&Config>) -> Result<()> {
     let current = match state::load_current() {
         Ok(value) => value,
         Err(err) => {
-            eprintln!("warning: current state is invalid, clearing it: {err:#}");
+            traxer::warn!("current state is invalid, clearing it: {err:#}");
             state::clear_current()?;
             return Ok(());
         }
@@ -162,6 +164,7 @@ fn down_current(config: Option<&Config>) -> Result<()> {
     cleanup_workspace_instances(&current.workspace, keep_instances, Some(instance_id))?;
 
     println!("stopped workspace `{}`", current.workspace);
+    traxer::info!("stopped workspace `{}`", current.workspace);
 
     Ok(())
 }
@@ -191,6 +194,7 @@ fn handle_follow_outcome(outcome: logs::FollowOutcome) -> Result<()> {
         return Ok(());
     }
 
+    traxer::info!("interrupt received (Ctrl+C); stopping workspace...");
     down_current(None).context("failed to stop workspace after Ctrl+C")?;
     std::process::exit(130);
 }
@@ -238,6 +242,7 @@ fn print_process_overview(instance_id: &str) -> Result<()> {
         Ok(value) => value,
         Err(err) => {
             println!("Processes: unavailable ({err:#})");
+            traxer::warn!("processes are unavailable: {err:#}");
             return Ok(());
         }
     };
@@ -260,18 +265,28 @@ fn status_current() -> Result<()> {
         Ok(value) => value,
         Err(err) => {
             println!("Current: invalid ({err:#})");
+            traxer::warn!("current state is invalid: {err:#}");
             return Ok(());
         }
     };
 
     let Some(current) = current else {
         println!("Current: none");
+        traxer::info!("status requested with no current workspace");
         return Ok(());
     };
 
+    traxer::info!(
+        workspace = %current.workspace,
+        status = %current.status.as_str(),
+        instance_id = current.instance_id.as_deref().unwrap_or("(none)"),
+        started_at = %current.started_at,
+        "status requested"
+    );
     print_current_overview(&current);
     let Some(instance_id) = current.instance_id.as_deref() else {
         println!("Processes: unavailable (no running instance)");
+        traxer::info!("status has no running instance");
         return Ok(());
     };
     print_process_overview(instance_id)
@@ -445,10 +460,7 @@ fn cleanup_workspace_instances(
         }
 
         if let Err(err) = fs::remove_dir_all(&instance.path) {
-            eprintln!(
-                "warning: failed to remove old instance `{}`: {err:#}",
-                instance.id
-            );
+            traxer::warn!("failed to remove old instance `{}`: {err:#}", instance.id);
         }
     }
 

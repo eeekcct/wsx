@@ -89,8 +89,8 @@ fn apply_envrc(workspace_path: &Path, env_map: &mut HashMap<String, String>) -> 
                 merge_env_output(&output.stdout, env_map);
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!(
-                    "warning: bash was not found on this machine; .envrc was skipped for this run"
+                traxer::warn!(
+                    "bash was not found on this machine; .envrc was skipped for this run"
                 );
             }
             Err(err) => {
