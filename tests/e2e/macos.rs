@@ -1,5 +1,5 @@
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-mod non_linux_e2e {
+#[cfg(target_os = "macos")]
+mod macos_e2e {
     use serde::Deserialize;
     use std::fs;
     use std::path::{Path, PathBuf};
