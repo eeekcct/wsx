@@ -5,7 +5,11 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
       - name: Checkout code
@@ -18,7 +22,7 @@ jobs:
         run: cargo test --release --verbose --bin wsx
 
       - name: Run e2e tests
-        run: cargo test --release --verbose --test e2e_cli
+        run: cargo test --release --verbose --test e2e_cli -- --test-threads=1
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features
