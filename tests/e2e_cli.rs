@@ -2248,7 +2248,11 @@ workspaces:
         ]);
         assert_success(&exec_cwd);
         let cwd = fs::read_to_string(demo.join("cwd.txt")).expect("cwd marker should be created");
-        assert_eq!(cwd.trim(), demo.to_string_lossy());
+        let actual_cwd = fs::canonicalize(PathBuf::from(cwd.trim()))
+            .expect("cwd from exec should point to an existing directory");
+        let expected_cwd =
+            fs::canonicalize(&demo).expect("workspace path should resolve to an existing directory");
+        assert_eq!(actual_cwd, expected_cwd);
     }
 
     #[test]
