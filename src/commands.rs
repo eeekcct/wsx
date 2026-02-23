@@ -152,7 +152,7 @@ fn down_current(config: Option<&Config>) -> Result<()> {
 
     let Some(instance_id) = current.instance_id.clone() else {
         println!("workspace `{}` has no running instance", current.workspace);
-        save_current_stopped(&mut current)?;
+        save_current_stopped(&mut current, true)?;
         return Ok(());
     };
 
@@ -163,7 +163,7 @@ fn down_current(config: Option<&Config>) -> Result<()> {
                 "pids file for instance `{}` could not be read; marking workspace as stopped: {err:#}",
                 instance_id
             );
-            save_current_stopped(&mut current)?;
+            save_current_stopped(&mut current, true)?;
             println!(
                 "workspace `{}` runtime metadata is unreadable; marked as stopped",
                 current.workspace
@@ -174,7 +174,7 @@ fn down_current(config: Option<&Config>) -> Result<()> {
 
     let grace_seconds = resolve_grace_seconds(config, &current.workspace);
     process::stop_workspace(&pids_file, grace_seconds)?;
-    save_current_stopped(&mut current)?;
+    save_current_stopped(&mut current, true)?;
     let keep_instances = resolve_keep_instances(config, &current.workspace);
     cleanup_workspace_instances(&current.workspace, keep_instances, Some(&instance_id))?;
 
@@ -186,10 +186,6 @@ fn down_current(config: Option<&Config>) -> Result<()> {
 
 fn logs_current(target: Option<String>, lines: Option<usize>, follow: bool) -> Result<()> {
     let mut current = load_current_reconciled()?.context("no current workspace")?;
-    if current.status != CurrentStatus::Running {
-        println!("no running instance");
-        return Ok(());
-    }
     let Some(instance_id) = current.instance_id.clone() else {
         println!("no running instance");
         return Ok(());
@@ -201,7 +197,7 @@ fn logs_current(target: Option<String>, lines: Option<usize>, follow: bool) -> R
                 "pids file for instance `{}` could not be read while showing logs; marking workspace as stopped: {err:#}",
                 instance_id
             );
-            save_current_stopped(&mut current)?;
+            save_current_stopped(&mut current, true)?;
             println!("no running instance");
             return Ok(());
         }
@@ -328,15 +324,11 @@ fn load_current_reconciled() -> Result<Option<CurrentState>> {
     };
 
     if current.status != CurrentStatus::Running {
-        if current.instance_id.is_some() {
-            current.instance_id = None;
-            state::save_current(&current)?;
-        }
         return Ok(Some(current));
     }
 
     let Some(instance_id) = current.instance_id.clone() else {
-        save_current_stopped(&mut current)?;
+        save_current_stopped(&mut current, true)?;
         return Ok(Some(current));
     };
 
@@ -347,7 +339,7 @@ fn load_current_reconciled() -> Result<Option<CurrentState>> {
                 "failed to read pids for running instance `{}`; marking workspace as stopped: {err:#}",
                 instance_id
             );
-            save_current_stopped(&mut current)?;
+            save_current_stopped(&mut current, true)?;
             return Ok(Some(current));
         }
     };
@@ -357,15 +349,17 @@ fn load_current_reconciled() -> Result<Option<CurrentState>> {
         .iter()
         .any(|entry| process::is_pid_running(entry.pid));
     if !has_running_pid {
-        save_current_stopped(&mut current)?;
+        save_current_stopped(&mut current, false)?;
     }
 
     Ok(Some(current))
 }
 
-fn save_current_stopped(current: &mut CurrentState) -> Result<()> {
+fn save_current_stopped(current: &mut CurrentState, clear_instance: bool) -> Result<()> {
     current.status = CurrentStatus::Stopped;
-    current.instance_id = None;
+    if clear_instance {
+        current.instance_id = None;
+    }
     state::save_current(current)
 }
 
