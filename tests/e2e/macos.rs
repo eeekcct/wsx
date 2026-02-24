@@ -902,4 +902,3 @@ workspaces:
         assert_stderr_contains(&result, "workspace `unknown` is not defined");
     }
 }
-
