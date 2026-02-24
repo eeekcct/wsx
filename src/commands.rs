@@ -142,17 +142,13 @@ fn down_current(config: Option<&Config>) -> Result<()> {
     };
 
     if current.status == CurrentStatus::Stopped {
-        if current.instance_id.is_some() {
-            current.instance_id = None;
-            state::save_current(&current)?;
-        }
         println!("workspace `{}` is already stopped", current.workspace);
         return Ok(());
     }
 
     let Some(instance_id) = current.instance_id.clone() else {
         println!("workspace `{}` has no running instance", current.workspace);
-        save_current_stopped(&mut current, true)?;
+        save_current_stopped(&mut current, false)?;
         return Ok(());
     };
 
@@ -174,7 +170,7 @@ fn down_current(config: Option<&Config>) -> Result<()> {
 
     let grace_seconds = resolve_grace_seconds(config, &current.workspace);
     process::stop_workspace(&pids_file, grace_seconds)?;
-    save_current_stopped(&mut current, true)?;
+    save_current_stopped(&mut current, false)?;
     let keep_instances = resolve_keep_instances(config, &current.workspace);
     cleanup_workspace_instances(&current.workspace, keep_instances, Some(&instance_id))?;
 

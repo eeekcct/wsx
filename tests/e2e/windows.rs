@@ -359,8 +359,8 @@ workspaces:
     }
 
     #[test]
-    fn down_clears_instance_and_logs_reports_no_running_instance() {
-        let env = TestEnv::new("nonlinux-down-clears-instance");
+    fn down_keeps_instance_and_logs_remain_available() {
+        let env = TestEnv::new("nonlinux-down-keeps-instance");
         let demo = env.create_workspace("demo");
         let app_cmd = python_cmd(r#"import time; print("demo-run", flush=True); time.sleep(1)"#);
 
@@ -384,6 +384,8 @@ workspaces:
 
         let switch = env.run(&["demo"]);
         assert_success(&switch);
+        let instance_id =
+            current_instance_id(&env).expect("current instance should exist after switch");
 
         let down = env.run(&["down"]);
         assert_success(&down);
@@ -391,11 +393,11 @@ workspaces:
 
         let meta = current_meta(&env).expect("current should exist after down");
         assert_eq!(meta.status.as_deref(), Some("stopped"));
-        assert_eq!(meta.instance_id, None);
+        assert_eq!(meta.instance_id.as_deref(), Some(instance_id.as_str()));
 
         let logs = env.run(&["logs", "--no-follow"]);
         assert_success(&logs);
-        assert_stdout_contains_all(&logs, &["no running instance"]);
+        assert_stdout_contains_all(&logs, &["demo-run"]);
     }
 
     #[test]
