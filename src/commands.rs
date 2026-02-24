@@ -146,22 +146,33 @@ fn down_current(config: Option<&Config>) -> Result<()> {
         return Ok(());
     }
 
-    let Some(instance_id) = current.instance_id.as_deref() else {
+    let Some(instance_id) = current.instance_id.clone() else {
         println!("workspace `{}` has no running instance", current.workspace);
-        current.status = CurrentStatus::Stopped;
-        state::save_current(&current)?;
+        save_current_stopped(&mut current, false)?;
         return Ok(());
     };
 
-    let pids_file = state::load_pids(instance_id)
-        .with_context(|| format!("pids file for instance `{}` could not be read", instance_id))?;
+    let pids_file = match state::load_pids(&instance_id) {
+        Ok(value) => value,
+        Err(err) => {
+            traxer::warn!(
+                "pids file for instance `{}` could not be read; marking workspace as stopped: {err:#}",
+                instance_id
+            );
+            save_current_stopped(&mut current, true)?;
+            println!(
+                "workspace `{}` runtime metadata is unreadable; marked as stopped",
+                current.workspace
+            );
+            return Ok(());
+        }
+    };
 
     let grace_seconds = resolve_grace_seconds(config, &current.workspace);
     process::stop_workspace(&pids_file, grace_seconds)?;
-    current.status = CurrentStatus::Stopped;
-    state::save_current(&current)?;
+    save_current_stopped(&mut current, false)?;
     let keep_instances = resolve_keep_instances(config, &current.workspace);
-    cleanup_workspace_instances(&current.workspace, keep_instances, Some(instance_id))?;
+    cleanup_workspace_instances(&current.workspace, keep_instances, Some(&instance_id))?;
 
     println!("stopped workspace `{}`", current.workspace);
     traxer::info!("stopped workspace `{}`", current.workspace);
@@ -170,12 +181,23 @@ fn down_current(config: Option<&Config>) -> Result<()> {
 }
 
 fn logs_current(target: Option<String>, lines: Option<usize>, follow: bool) -> Result<()> {
-    let current = load_current_reconciled()?.context("no current workspace")?;
-    let Some(instance_id) = current.instance_id.as_deref() else {
+    let mut current = load_current_reconciled()?.context("no current workspace")?;
+    let Some(instance_id) = current.instance_id.clone() else {
         println!("no running instance");
         return Ok(());
     };
-    let pids = state::load_pids(instance_id)?;
+    let pids = match state::load_pids(&instance_id) {
+        Ok(value) => value,
+        Err(err) => {
+            traxer::warn!(
+                "pids file for instance `{}` could not be read while showing logs; marking workspace as stopped: {err:#}",
+                instance_id
+            );
+            save_current_stopped(&mut current, true)?;
+            println!("no running instance");
+            return Ok(());
+        }
+    };
 
     let (default_target, default_lines) = resolve_log_defaults(&current.workspace, &pids);
 
@@ -302,14 +324,20 @@ fn load_current_reconciled() -> Result<Option<CurrentState>> {
     }
 
     let Some(instance_id) = current.instance_id.clone() else {
-        current.status = CurrentStatus::Stopped;
-        state::save_current(&current)?;
+        save_current_stopped(&mut current, true)?;
         return Ok(Some(current));
     };
 
     let pids = match state::load_pids(&instance_id) {
         Ok(pids) => pids,
-        Err(_) => return Ok(Some(current)),
+        Err(err) => {
+            traxer::warn!(
+                "failed to read pids for running instance `{}`; marking workspace as stopped: {err:#}",
+                instance_id
+            );
+            save_current_stopped(&mut current, true)?;
+            return Ok(Some(current));
+        }
     };
 
     let has_running_pid = pids
@@ -317,11 +345,18 @@ fn load_current_reconciled() -> Result<Option<CurrentState>> {
         .iter()
         .any(|entry| process::is_pid_running(entry.pid));
     if !has_running_pid {
-        current.status = CurrentStatus::Stopped;
-        state::save_current(&current)?;
+        save_current_stopped(&mut current, false)?;
     }
 
     Ok(Some(current))
+}
+
+fn save_current_stopped(current: &mut CurrentState, clear_instance: bool) -> Result<()> {
+    current.status = CurrentStatus::Stopped;
+    if clear_instance {
+        current.instance_id = None;
+    }
+    state::save_current(current)
 }
 
 fn resolve_grace_seconds(config: Option<&Config>, workspace_name: &str) -> u64 {
