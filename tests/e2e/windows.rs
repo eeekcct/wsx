@@ -260,6 +260,332 @@ workspaces:
     }
 
     #[test]
+    fn workspace_and_subcommand_together_fails() {
+        let env = TestEnv::new("nonlinux-workspace-and-subcommand");
+        let result = env.run(&["list", "demo"]);
+        assert_failure(&result);
+        assert_stderr_contains(&result, "unexpected argument");
+    }
+
+    #[test]
+    fn select_sets_stopped_without_starting_processes() {
+        let env = TestEnv::new("nonlinux-select-stopped-no-start");
+        let demo = env.create_workspace("demo");
+        let marker = demo.join("started.txt");
+        let app_cmd = python_cmd(
+            r#"import pathlib,time; pathlib.Path("started.txt").write_text("started\n"); time.sleep(60)"#,
+        );
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: {}
+"#,
+            yaml_path(&demo),
+            app_cmd,
+        ));
+
+        let select = env.run(&["select", "demo"]);
+        assert_success(&select);
+        assert_stdout_contains_all(&select, &["selected workspace `demo`"]);
+        assert!(
+            !marker.exists(),
+            "select should not start workspace processes"
+        );
+
+        let meta = current_meta(&env).expect("current should exist after select");
+        assert_eq!(meta.status.as_deref(), Some("stopped"));
+        assert_eq!(meta.instance_id, None);
+
+        let status = env.run(&["status"]);
+        assert_success(&status);
+        assert_stdout_contains_all(
+            &status,
+            &[
+                "Current workspace: demo",
+                "State: stopped",
+                "Instance ID: (none)",
+                "Processes: unavailable (no running instance)",
+            ],
+        );
+    }
+
+    #[test]
+    fn down_after_select_succeeds() {
+        let env = TestEnv::new("nonlinux-down-after-select");
+        let demo = env.create_workspace("demo");
+        let app_cmd = python_cmd(r#"import time; print("demo", flush=True); time.sleep(60)"#);
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: {}
+"#,
+            yaml_path(&demo),
+            app_cmd,
+        ));
+
+        let select = env.run(&["select", "demo"]);
+        assert_success(&select);
+
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        assert_down_succeeded_message(&down, "demo");
+    }
+
+    #[test]
+    fn up_after_select_starts_workspace_and_sets_instance_id() {
+        let env = TestEnv::new("nonlinux-up-after-select");
+        let demo = env.create_workspace("demo");
+        let app_cmd = python_cmd(r#"import time; print("demo", flush=True); time.sleep(1)"#);
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: {}
+"#,
+            yaml_path(&demo),
+            app_cmd,
+        ));
+
+        let select = env.run(&["select", "demo"]);
+        assert_success(&select);
+
+        let up = env.run(&["up"]);
+        assert_success(&up);
+        assert_stdout_contains_all(&up, &["started workspace `demo`"]);
+
+        let meta = current_meta(&env).expect("current should exist after up");
+        assert!(
+            meta.instance_id.is_some(),
+            "up should set instance_id after select"
+        );
+    }
+
+    #[test]
+    fn config_missing_file_returns_error() {
+        let env = TestEnv::new("nonlinux-config-missing");
+        let list = env.run(&["list"]);
+        assert_failure(&list);
+        assert_stderr_contains(&list, "config file not found");
+    }
+
+    #[test]
+    fn config_with_empty_workspaces_returns_error() {
+        let env = TestEnv::new("nonlinux-config-empty-workspaces");
+        env.write_config(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces: {}
+"#,
+        );
+
+        let list = env.run(&["list"]);
+        assert_failure(&list);
+        assert_stderr_contains(&list, "workspaces is empty");
+    }
+
+    #[test]
+    fn workspace_with_no_processes_fails() {
+        let env = TestEnv::new("nonlinux-workspace-no-processes");
+        let demo = env.create_workspace("demo");
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes: []
+"#,
+            yaml_path(&demo),
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_failure(&switch);
+        assert_stderr_contains(&switch, "has no processes");
+    }
+
+    #[test]
+    fn status_reconciles_when_stale_running() {
+        let env = TestEnv::new("nonlinux-status-reconcile");
+        let demo = env.create_workspace("demo");
+        let app_cmd = python_cmd(r#"import time; print("demo-run", flush=True); time.sleep(1)"#);
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: {}
+"#,
+            yaml_path(&demo),
+            app_cmd,
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let before_status = current_meta(&env).expect("current should exist after switch");
+        assert_eq!(before_status.status.as_deref(), Some("running"));
+
+        let status = env.run(&["status"]);
+        assert_success(&status);
+        assert!(stdout(&status).contains("State: stopped"));
+
+        let after_status = current_meta(&env).expect("current should exist after status");
+        assert_eq!(after_status.status.as_deref(), Some("stopped"));
+    }
+
+    #[test]
+    fn up_restarts_when_stale_running() {
+        let env = TestEnv::new("nonlinux-up-restarts-stale-running");
+        let demo = env.create_workspace("demo");
+        let app_cmd = python_cmd(r#"import time; print("demo-run", flush=True); time.sleep(1)"#);
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: {}
+"#,
+            yaml_path(&demo),
+            app_cmd,
+        ));
+
+        let first_switch = env.run(&["demo"]);
+        assert_success(&first_switch);
+        let first_instance =
+            current_instance_id(&env).expect("current instance should exist after first switch");
+
+        let up = env.run(&["up"]);
+        assert_success(&up);
+        assert_stdout_contains_all(&up, &["started workspace `demo`"]);
+
+        let meta_after_up = current_meta(&env).expect("current should exist after up");
+        assert_ne!(
+            meta_after_up.instance_id.as_deref(),
+            Some(first_instance.as_str())
+        );
+    }
+
+    #[test]
+    fn logs_default_and_explicit_stream_work() {
+        let env = TestEnv::new("nonlinux-logs");
+        let demo = env.create_workspace("demo");
+        let backend_cmd = python_cmd(
+            r#"import time,sys; print("backend-out", flush=True); print("backend-err", file=sys.stderr, flush=True); time.sleep(1)"#,
+        );
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: backend
+        default_log: true
+        default_stream: err
+        cmd: {}
+"#,
+            yaml_path(&demo),
+            backend_cmd,
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let logs_default = env.run(&["logs", "--no-follow"]);
+        assert_success(&logs_default);
+        assert!(stdout(&logs_default).contains("backend-err"));
+
+        let logs_combined = env.run(&["logs", "backend", "--no-follow"]);
+        assert_success(&logs_combined);
+        let combined_stdout = stdout(&logs_combined);
+        assert!(combined_stdout.contains("backend-out"));
+        assert!(combined_stdout.contains("backend-err"));
+
+        let logs_err = env.run(&["logs", "backend:err", "--no-follow"]);
+        assert_success(&logs_err);
+        assert!(stdout(&logs_err).contains("backend-err"));
+    }
+
+    #[test]
+    fn logs_invalid_target_fails() {
+        let env = TestEnv::new("nonlinux-logs-invalid-target");
+        let demo = env.create_workspace("demo");
+        let app_cmd = python_cmd(r#"import time; print("app", flush=True); time.sleep(1)"#);
+
+        env.write_config(&format!(
+            r#"defaults:
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: app
+        cmd: {}
+"#,
+            yaml_path(&demo),
+            app_cmd,
+        ));
+
+        let switch = env.run(&["demo"]);
+        assert_success(&switch);
+
+        let unknown = env.run(&["logs", "worker", "--no-follow"]);
+        assert_failure(&unknown);
+        assert_stderr_contains(&unknown, "process `worker` is not running");
+
+        let invalid_stream = env.run(&["logs", "app:foo", "--no-follow"]);
+        assert_failure(&invalid_stream);
+        assert_stderr_contains(&invalid_stream, "invalid logs stream `foo`");
+    }
+
+    #[test]
     fn switch_status_and_down_happy_path() {
         let env = TestEnv::new("nonlinux-lifecycle");
         let demo = env.create_workspace("demo");
