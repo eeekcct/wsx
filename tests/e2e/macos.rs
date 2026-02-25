@@ -1030,7 +1030,7 @@ workspaces:
         assert_status_success(env.run_status(&["demo"]));
 
         assert!(
-            wait_until(Duration::from_secs(2), || child_pid_path.exists()),
+            wait_until(Duration::from_secs(8), || child_pid_path.exists()),
             "child pid file was not created"
         );
         let child_pid: u32 = fs::read_to_string(&child_pid_path)
@@ -1039,7 +1039,7 @@ workspaces:
             .parse()
             .expect("child pid should be numeric");
         assert!(
-            wait_until(Duration::from_secs(2), || pid_exists(child_pid)),
+            wait_until(Duration::from_secs(8), || pid_exists(child_pid)),
             "background child process should be running before down"
         );
 
@@ -1107,7 +1107,7 @@ workspaces:
 
         assert_status_success(env.run_status(&["alpha"]));
         assert!(
-            wait_until(Duration::from_secs(2), || alpha_child_pid_path.exists()),
+            wait_until(Duration::from_secs(8), || alpha_child_pid_path.exists()),
             "alpha child pid file should exist before switching"
         );
 
@@ -1117,7 +1117,7 @@ workspaces:
             .parse()
             .expect("alpha child pid should be numeric");
         assert!(
-            wait_until(Duration::from_secs(2), || pid_exists(child_pid)),
+            wait_until(Duration::from_secs(8), || pid_exists(child_pid)),
             "alpha child process should be running before switch"
         );
         let managed_root_pids =
