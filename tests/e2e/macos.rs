@@ -1,10 +1,13 @@
 #[cfg(target_os = "macos")]
 mod macos_e2e {
     use serde::Deserialize;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::process::{Command, ExitStatus, Output};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use sysinfo::{Pid, ProcessStatus, System};
 
     struct TempDirGuard {
         path: PathBuf,
@@ -78,6 +81,17 @@ mod macos_e2e {
             cmd.output().expect("failed to execute wsx")
         }
 
+        fn run_status(&self, args: &[&str]) -> ExitStatus {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_wsx"));
+            cmd.args(args)
+                .env("HOME", &self.home_dir)
+                .env("USERPROFILE", &self.home_dir)
+                .env("HOMEDRIVE", "")
+                .env("HOMEPATH", "")
+                .env_remove("WSX_HOME");
+            cmd.status().expect("failed to execute wsx")
+        }
+
         fn wsx_home(&self) -> PathBuf {
             self.home_dir.join(".config").join("wsx")
         }
@@ -87,6 +101,16 @@ mod macos_e2e {
     struct CurrentMeta {
         instance_id: Option<String>,
         status: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PidsMeta {
+        entries: Vec<PidEntryMeta>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PidEntryMeta {
+        pid: u32,
     }
 
     fn yaml_quote(value: &str) -> String {
@@ -159,6 +183,14 @@ mod macos_e2e {
         );
     }
 
+    fn assert_status_success(status: ExitStatus) {
+        assert!(
+            status.success(),
+            "expected success status, exit={:?}",
+            status.code()
+        );
+    }
+
     fn assert_down_succeeded_message(output: &Output, workspace: &str) {
         let out = stdout(output);
         assert!(
@@ -188,6 +220,143 @@ mod macos_e2e {
         let raw = fs::read_to_string(current_path).expect("failed to read current.json");
         let current: CurrentMeta = serde_json::from_str(&raw).expect("invalid current.json");
         Some(current)
+    }
+
+    fn current_process_pids(env: &TestEnv) -> Option<Vec<u32>> {
+        let instance_id = current_instance_id(env)?;
+        let pids_path = env
+            .wsx_home()
+            .join("instances")
+            .join(instance_id)
+            .join("pids.json");
+        if !pids_path.exists() {
+            return None;
+        }
+
+        let raw = fs::read_to_string(pids_path).expect("failed to read pids.json");
+        let meta: PidsMeta = serde_json::from_str(&raw).expect("invalid pids.json");
+        Some(meta.entries.iter().map(|entry| entry.pid).collect())
+    }
+
+    fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        condition()
+    }
+
+    fn pid_exists(pid: u32) -> bool {
+        let mut system = System::new_all();
+        system.refresh_all();
+        match system.process(Pid::from_u32(pid)) {
+            Some(process) => !matches!(process.status(), ProcessStatus::Dead),
+            None => false,
+        }
+    }
+
+    fn snapshot_process_tree(root_pids: &[u32]) -> Vec<u32> {
+        let mut system = System::new_all();
+        system.refresh_all();
+
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (pid, process) in system.processes() {
+            let Some(parent) = process.parent() else {
+                continue;
+            };
+            children
+                .entry(parent.as_u32())
+                .or_default()
+                .push(pid.as_u32());
+        }
+
+        let mut tracked = HashSet::new();
+        let mut stack = root_pids.to_vec();
+        while let Some(pid) = stack.pop() {
+            if !tracked.insert(pid) {
+                continue;
+            }
+            if let Some(child_pids) = children.get(&pid) {
+                stack.extend(child_pids.iter().copied());
+            }
+        }
+
+        let mut out = tracked.into_iter().collect::<Vec<_>>();
+        out.sort_unstable();
+        out
+    }
+
+    fn assert_no_running_pids(pids: &[u32], timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let alive = pids
+                .iter()
+                .copied()
+                .filter(|pid| pid_exists(*pid))
+                .collect::<Vec<_>>();
+            if alive.is_empty() {
+                return;
+            }
+
+            if Instant::now() >= deadline {
+                panic!(
+                    "processes remained after {:?}: {}",
+                    timeout,
+                    alive
+                        .into_iter()
+                        .map(|pid| pid.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn is_zombie_pid(pid: u32) -> bool {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("failed to execute ps");
+        if !output.status.success() {
+            return false;
+        }
+
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .starts_with('Z')
+    }
+
+    fn assert_no_zombies_for_tree(pids: &[u32], timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let zombies = pids
+                .iter()
+                .copied()
+                .filter(|pid| is_zombie_pid(*pid))
+                .collect::<Vec<_>>();
+            if zombies.is_empty() {
+                return;
+            }
+
+            if Instant::now() >= deadline {
+                panic!(
+                    "zombie processes remained after {:?}: {}",
+                    timeout,
+                    zombies
+                        .into_iter()
+                        .map(|pid| pid.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]
@@ -822,6 +991,149 @@ workspaces:
         let down = env.run(&["down"]);
         assert_success(&down);
         assert_down_succeeded_message(&down, "demo");
+    }
+
+    #[test]
+    fn down_kills_background_child_processes_without_zombies() {
+        let env = TestEnv::new("nonlinux-down-kills-child-processes");
+        let demo = env.create_workspace("demo");
+        let short_cmd = python_cmd(r#"import time; print("short", flush=True); time.sleep(1)"#);
+        let launcher_cmd = python_cmd(
+            r#"import pathlib,subprocess,sys,time; child=subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]); pathlib.Path("child.pid").write_text(str(child.pid)); time.sleep(60)"#,
+        );
+        let child_pid_path = demo.join("child.pid");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  demo:
+    path: {}
+    logs:
+      default: short
+    processes:
+      - name: short
+        default_log: true
+        cmd: {}
+      - name: launcher
+        cmd: {}
+"#,
+            yaml_path(&demo),
+            short_cmd,
+            launcher_cmd,
+        ));
+
+        assert_status_success(env.run_status(&["demo"]));
+
+        assert!(
+            wait_until(Duration::from_secs(8), || child_pid_path.exists()),
+            "child pid file was not created"
+        );
+        let child_pid: u32 = fs::read_to_string(&child_pid_path)
+            .expect("failed to read child pid")
+            .trim()
+            .parse()
+            .expect("child pid should be numeric");
+        assert!(
+            wait_until(Duration::from_secs(8), || pid_exists(child_pid)),
+            "background child process should be running before down"
+        );
+
+        let managed_root_pids =
+            current_process_pids(&env).expect("managed pids should exist before down");
+        let mut tracked_tree = snapshot_process_tree(&managed_root_pids);
+        tracked_tree.push(child_pid);
+        tracked_tree.sort_unstable();
+        tracked_tree.dedup();
+
+        let down = env.run(&["down"]);
+        assert_success(&down);
+        assert_down_succeeded_message(&down, "demo");
+        assert!(
+            wait_until(Duration::from_secs(3), || !pid_exists(child_pid)),
+            "background child process should be terminated by down"
+        );
+        assert_no_running_pids(&tracked_tree, Duration::from_secs(3));
+        assert_no_zombies_for_tree(&tracked_tree, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn switch_stops_previous_workspace_without_zombies() {
+        let env = TestEnv::new("nonlinux-switch-stops-previous");
+        let alpha = env.create_workspace("alpha");
+        let beta = env.create_workspace("beta");
+        let alpha_short_cmd =
+            python_cmd(r#"import time; print("alpha-short", flush=True); time.sleep(1)"#);
+        let alpha_launcher_cmd = python_cmd(
+            r#"import pathlib,subprocess,sys,time; child=subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]); pathlib.Path("child.pid").write_text(str(child.pid)); time.sleep(60)"#,
+        );
+        let beta_cmd = python_cmd(r#"import time; print("beta", flush=True); time.sleep(1)"#);
+        let alpha_child_pid_path = alpha.join("child.pid");
+
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+  env:
+    dotenv: [.env]
+    envrc: false
+workspaces:
+  alpha:
+    path: {}
+    logs:
+      default: short
+    processes:
+      - name: short
+        default_log: true
+        cmd: {}
+      - name: launcher
+        cmd: {}
+  beta:
+    path: {}
+    processes:
+      - name: app
+        cmd: {}
+"#,
+            yaml_path(&alpha),
+            alpha_short_cmd,
+            alpha_launcher_cmd,
+            yaml_path(&beta),
+            beta_cmd,
+        ));
+
+        assert_status_success(env.run_status(&["alpha"]));
+        assert!(
+            wait_until(Duration::from_secs(8), || alpha_child_pid_path.exists()),
+            "alpha child pid file should exist before switching"
+        );
+
+        let child_pid: u32 = fs::read_to_string(&alpha_child_pid_path)
+            .expect("failed to read alpha child pid")
+            .trim()
+            .parse()
+            .expect("alpha child pid should be numeric");
+        assert!(
+            wait_until(Duration::from_secs(8), || pid_exists(child_pid)),
+            "alpha child process should be running before switch"
+        );
+        let managed_root_pids =
+            current_process_pids(&env).expect("alpha managed pids should exist");
+        let mut tracked_tree = snapshot_process_tree(&managed_root_pids);
+        tracked_tree.push(child_pid);
+        tracked_tree.sort_unstable();
+        tracked_tree.dedup();
+
+        assert_status_success(env.run_status(&["beta"]));
+        assert!(
+            wait_until(Duration::from_secs(3), || !pid_exists(child_pid)),
+            "switch should terminate previous workspace background child process"
+        );
+        assert_no_running_pids(&tracked_tree, Duration::from_secs(3));
+        assert_no_zombies_for_tree(&tracked_tree, Duration::from_secs(3));
     }
 
     #[test]
