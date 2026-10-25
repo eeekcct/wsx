@@ -143,7 +143,7 @@ impl Config {
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
 
-        let config: Self = serde_yaml::from_str(&raw)
+        let config: Self = serde_norway::from_str(&raw)
             .with_context(|| format!("invalid YAML in {}", path.display()))?;
 
         if config.workspaces.is_empty() {
@@ -340,6 +340,218 @@ fn validate_log_target(target: &str, process_names: &HashSet<&str>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_yaml(raw: &str) -> Config {
+        serde_norway::from_str(raw).expect("valid config YAML")
+    }
+
+    #[test]
+    fn yaml_empty_workspace_map_is_left_for_load_validation() {
+        // Config::load rejects an empty workspace map after deserialization.
+        for raw in ["", "{}", "workspaces: {}"] {
+            let config = parse_yaml(raw);
+            assert!(config.workspaces.is_empty());
+            assert_eq!(config.defaults.stop.grace_seconds, 5);
+        }
+    }
+
+    #[test]
+    fn yaml_documented_examples_parse() {
+        let docs = include_str!("../docs/CONFIG.md").replace("\r\n", "\n");
+        let examples: Vec<_> = docs
+            .split("```yaml\n")
+            .skip(1)
+            .map(|block| block.split("```").next().unwrap())
+            .filter(|block| block.contains("workspaces:"))
+            .collect();
+        assert_eq!(examples.len(), 2);
+        for example in examples {
+            let config = parse_yaml(example);
+            assert_eq!(config.defaults.stop.grace_seconds, 5);
+            assert_eq!(config.defaults.env.dotenv, [".env"]);
+            assert!(!config.defaults.env.envrc);
+            assert_eq!(config.defaults.logs.lines, 200);
+            assert_eq!(config.defaults.logs.default, "");
+            assert_eq!(config.defaults.logs.keep_instances, 20);
+            let workspace = &config.workspaces["deva"];
+            assert_eq!(workspace.processes[0].name.as_deref(), Some("backend"));
+            assert_eq!(workspace.processes[0].cmd, ["go", "run", "./cmd/server"]);
+        }
+    }
+
+    #[test]
+    fn yaml_omitted_fields_keep_defaults() {
+        let config = parse_yaml(
+            r#"
+workspaces:
+  deva:
+    path: .
+    processes:
+      - cmd: [echo, hello]
+"#,
+        );
+        let workspace = config.resolve_workspace("deva").expect("resolve defaults");
+        assert_eq!(workspace.grace_seconds, 5);
+        assert_eq!(workspace.dotenv, [".env"]);
+        assert!(!workspace.envrc);
+        assert_eq!(workspace.logs_lines, 200);
+        assert_eq!(workspace.logs_keep_instances, 20);
+        assert_eq!(workspace.logs_default, "echo");
+        assert_eq!(workspace.processes[0].name, "echo");
+        assert!(!workspace.processes[0].default_log);
+        assert!(workspace.processes[0].default_stream.is_none());
+    }
+
+    #[test]
+    fn yaml_workspace_values_override_global_defaults() {
+        let config = parse_yaml(
+            r#"
+defaults:
+  stop: {grace_seconds: 9}
+  env: {dotenv: [.env.global], envrc: true}
+  logs: {lines: 300, default: backend:out, keep_instances: 30}
+workspaces:
+  deva:
+    path: .
+    stop: {grace_seconds: 0}
+    env: {dotenv: [], envrc: false}
+    logs: {lines: 0, default: backend:err, keep_instances: 0}
+    processes:
+      - name: backend
+        cmd: [echo, hello]
+        default_log: true
+        default_stream: err
+"#,
+        );
+        assert_eq!(config.defaults.stop.grace_seconds, 9);
+        assert_eq!(config.defaults.env.dotenv, [".env.global"]);
+        assert!(config.defaults.env.envrc);
+        assert_eq!(config.defaults.logs.lines, 300);
+        assert_eq!(config.defaults.logs.default, "backend:out");
+        assert_eq!(config.defaults.logs.keep_instances, 30);
+        let workspace = config.resolve_workspace("deva").expect("resolve overrides");
+        assert_eq!(workspace.grace_seconds, 0);
+        assert!(workspace.dotenv.is_empty());
+        assert!(!workspace.envrc);
+        assert_eq!(workspace.logs_lines, 0);
+        assert_eq!(workspace.logs_default, "backend:err");
+        assert_eq!(workspace.logs_keep_instances, 0);
+        assert!(workspace.processes[0].default_log);
+        assert_eq!(
+            workspace.processes[0].default_stream.as_deref(),
+            Some("err")
+        );
+    }
+
+    #[test]
+    fn yaml_null_and_omitted_optional_fields_inherit_defaults() {
+        for optional_fields in [
+            "",
+            r#"
+    stop: {grace_seconds: null}
+    env: {dotenv: null, envrc: ~}
+    logs: {lines: null, default: null, keep_instances: null}
+"#,
+        ] {
+            for process_fields in ["", "name: null, default_stream: ~,"] {
+                let config = parse_yaml(&format!(
+                    r#"
+defaults:
+  stop: {{grace_seconds: 9}}
+  env: {{dotenv: [.env.global], envrc: true}}
+  logs: {{lines: 300, default: echo:out, keep_instances: 30}}
+workspaces:
+  deva:
+    path: .
+{optional_fields}
+    processes:
+      - {{{process_fields} cmd: [echo, hello]}}
+"#
+                ));
+                let raw = &config.workspaces["deva"];
+                assert!(raw.stop.grace_seconds.is_none());
+                assert!(raw.env.dotenv.is_none());
+                assert!(raw.env.envrc.is_none());
+                assert!(raw.logs.lines.is_none());
+                assert!(raw.logs.default.is_none());
+                assert!(raw.logs.keep_instances.is_none());
+                assert!(raw.processes[0].name.is_none());
+                assert!(raw.processes[0].default_stream.is_none());
+                let workspace = config.resolve_workspace("deva").expect("resolve inherited");
+                assert_eq!(workspace.grace_seconds, 9);
+                assert_eq!(workspace.dotenv, [".env.global"]);
+                assert!(workspace.envrc);
+                assert_eq!(workspace.logs_lines, 300);
+                assert_eq!(workspace.logs_default, "echo:out");
+                assert_eq!(workspace.logs_keep_instances, 30);
+            }
+        }
+    }
+
+    #[test]
+    fn yaml_preserves_quoted_paths_commands_and_aliases() {
+        let config = parse_yaml(
+            r#"
+workspaces:
+  deva:
+    path: 'C:\Users\Some User\project'
+    processes:
+      - name: 'NO'
+        cmd: &command ["sh", "-c", "echo 'hello: #world' && printf \"yes\""]
+      - cmd: *command
+  other:
+    path: "/tmp/a path/#project"
+"#,
+        );
+        let workspace = &config.workspaces["deva"];
+        assert_eq!(workspace.path, r"C:\Users\Some User\project");
+        assert_eq!(workspace.processes[0].name.as_deref(), Some("NO"));
+        assert_eq!(
+            workspace.processes[0].cmd,
+            ["sh", "-c", r#"echo 'hello: #world' && printf "yes""#]
+        );
+        assert_eq!(workspace.processes[1].cmd, workspace.processes[0].cmd);
+        assert_eq!(config.workspaces["other"].path, "/tmp/a path/#project");
+        assert!(config.workspaces["other"].processes.is_empty());
+    }
+
+    #[test]
+    fn yaml_rejects_invalid_types_duplicate_fields_and_documents() {
+        for raw in [
+            "defaults: {stop: {grace_seconds: -1}}",
+            "defaults: {env: {envrc: maybe}}",
+            "defaults: {env: {dotenv: .env}}",
+            "defaults: {logs: {lines: null}}",
+            "workspaces: []",
+            "workspaces: {deva: {processes: []}}",
+            "workspaces: {deva: {path: ., processes: [{cmd: echo}]}}",
+            "workspaces: {deva: {path: ., processes: [{cmd: [echo], default_log: null}]}}",
+            "defaults: {}\ndefaults: {}",
+            "workspaces: {deva: {path: ., path: other}}",
+            "workspaces: [",
+            "workspaces: *undefined",
+            "---\nworkspaces: {}\n---\nworkspaces: {}",
+        ] {
+            assert!(
+                serde_norway::from_str::<Config>(raw).is_err(),
+                "unexpectedly accepted {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_duplicate_workspace_map_keys_keep_last_value() {
+        // Struct fields reject duplicates, but HashMap deserialization keeps the last value.
+        let config = parse_yaml(
+            r#"
+workspaces:
+  deva: {path: first}
+  deva: {path: second}
+"#,
+        );
+        assert_eq!(config.workspaces.len(), 1);
+        assert_eq!(config.workspaces["deva"].path, "second");
+    }
 
     #[test]
     fn resolves_process_names_with_suffix() {
