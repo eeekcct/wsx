@@ -18,4 +18,4 @@ jobs:
           set -euo pipefail
           rustup default stable
           cargo install cargo-deny --locked
-          cargo deny --manifest-path Cargo.toml check --config deny.toml licenses
+          cargo deny --manifest-path Cargo.toml --config deny.toml check licenses
