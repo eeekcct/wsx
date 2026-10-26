@@ -153,19 +153,69 @@ impl Config {
         Ok(config)
     }
 
-    pub fn default_grace_seconds(&self) -> u64 {
-        self.defaults.stop.grace_seconds
-    }
-
     pub fn default_log_lines(&self) -> usize {
         self.defaults.logs.lines
     }
 
-    pub fn default_log_keep_instances(&self) -> usize {
-        self.defaults.logs.keep_instances
+    pub fn workspace_grace_seconds(&self, workspace_name: &str) -> u64 {
+        self.workspaces
+            .get(workspace_name)
+            .and_then(|workspace| workspace.stop.grace_seconds)
+            .unwrap_or(self.defaults.stop.grace_seconds)
+    }
+
+    pub fn workspace_log_keep_instances(&self, workspace_name: &str) -> usize {
+        self.workspaces
+            .get(workspace_name)
+            .and_then(|workspace| workspace.logs.keep_instances)
+            .unwrap_or(self.defaults.logs.keep_instances)
+    }
+
+    pub fn workspace_log_defaults(&self, workspace_name: &str) -> Result<(String, usize)> {
+        let workspace = self.resolve_workspace_options(workspace_name)?;
+        Ok((workspace.logs_default, workspace.logs_lines))
     }
 
     pub fn resolve_workspace(&self, workspace_name: &str) -> Result<ResolvedWorkspace> {
+        let mut workspace = self.resolve_workspace_options(workspace_name)?;
+        validate_workspace_path(&workspace.path)?;
+        // Selection is the only operation that interprets a relative configured
+        // path against the caller's cwd. Pin the canonical absolute directory.
+        workspace.path = fs::canonicalize(&workspace.path).with_context(|| {
+            format!(
+                "failed to resolve workspace path: {}",
+                workspace.path.display()
+            )
+        })?;
+        Ok(workspace)
+    }
+
+    pub fn resolve_current_workspace(
+        &self,
+        workspace_name: &str,
+        pinned_path: Option<&Path>,
+    ) -> Result<ResolvedWorkspace> {
+        let mut workspace = self.resolve_workspace_options(workspace_name)?;
+        if let Some(path) = pinned_path {
+            if !path.is_absolute() {
+                bail!(
+                    "workspace `{workspace_name}` has an invalid saved path; run `wsx select {workspace_name}` to select it again"
+                );
+            }
+            workspace.path = path.to_path_buf();
+            validate_workspace_path(&workspace.path)?;
+        } else if workspace.path.is_absolute() {
+            // Legacy state is safe to migrate only when config is unambiguous.
+            return self.resolve_workspace(workspace_name);
+        } else {
+            bail!(
+                "workspace `{workspace_name}` has no saved absolute path; run `wsx select {workspace_name}` from the intended directory to select it again"
+            );
+        }
+        Ok(workspace)
+    }
+
+    fn resolve_workspace_options(&self, workspace_name: &str) -> Result<ResolvedWorkspace> {
         let workspace = self
             .workspaces
             .get(workspace_name)
@@ -176,12 +226,6 @@ impl Config {
         }
 
         let path = PathBuf::from(&workspace.path);
-        if !path.exists() {
-            bail!("workspace path does not exist: {}", path.display());
-        }
-        if !path.is_dir() {
-            bail!("workspace path is not a directory: {}", path.display());
-        }
 
         let grace_seconds = workspace
             .stop
@@ -229,9 +273,20 @@ impl Config {
     }
 }
 
+fn validate_workspace_path(path: &Path) -> Result<()> {
+    if !path.exists() {
+        bail!("workspace path does not exist: {}", path.display());
+    }
+    if !path.is_dir() {
+        bail!("workspace path is not a directory: {}", path.display());
+    }
+    Ok(())
+}
+
 fn resolve_processes(items: &[ProcessConfig]) -> Result<Vec<ResolvedProcess>> {
     let mut out = Vec::with_capacity(items.len());
     let mut name_counter: HashMap<String, usize> = HashMap::new();
+    let mut used_names = HashSet::new();
 
     for process in items {
         if process.cmd.is_empty() {
@@ -249,11 +304,16 @@ fn resolve_processes(items: &[ProcessConfig]) -> Result<Vec<ResolvedProcess>> {
         }
 
         let count = name_counter.entry(base_name.clone()).or_insert(0);
-        *count += 1;
-        let resolved_name = if *count == 1 {
-            base_name
-        } else {
-            format!("{}-{}", base_name, *count)
+        let resolved_name = loop {
+            *count += 1;
+            let candidate = if *count == 1 {
+                base_name.clone()
+            } else {
+                format!("{}-{}", base_name, *count)
+            };
+            if used_names.insert(candidate.clone()) {
+                break candidate;
+            }
         };
 
         out.push(ResolvedProcess {
@@ -554,6 +614,67 @@ workspaces:
     }
 
     #[test]
+    fn current_workspace_uses_saved_path_before_validating_configured_path() {
+        let config = parse_yaml(
+            r#"
+workspaces:
+  demo:
+    path: /wsx-nonexistent-configured-path
+    processes:
+      - cmd: [echo, hello]
+"#,
+        );
+        let saved = std::env::current_dir().expect("current directory");
+        let workspace = config
+            .resolve_current_workspace("demo", Some(&saved))
+            .expect("saved directory wins over edited config path");
+        assert_eq!(workspace.path, saved);
+    }
+
+    #[test]
+    fn legacy_relative_path_requires_reselection() {
+        let config = parse_yaml(
+            r#"
+workspaces:
+  demo:
+    path: .
+    processes:
+      - cmd: [echo, hello]
+"#,
+        );
+        let err = config
+            .resolve_current_workspace("demo", None)
+            .expect_err("legacy relative path is ambiguous");
+        assert!(err.to_string().contains("wsx select demo"));
+        let err = config
+            .resolve_current_workspace("demo", Some(Path::new("relative-saved-path")))
+            .expect_err("saved path must be absolute");
+        assert!(err.to_string().contains("invalid saved path"));
+    }
+
+    #[test]
+    fn runtime_settings_do_not_require_the_workspace_directory() {
+        let config = parse_yaml(
+            r#"
+workspaces:
+  demo:
+    path: /wsx-nonexistent-configured-path
+    stop: {grace_seconds: 17}
+    logs: {keep_instances: 9, lines: 3, default: app:err}
+    processes:
+      - name: app
+        cmd: [echo, hello]
+"#,
+        );
+        assert_eq!(config.workspace_grace_seconds("demo"), 17);
+        assert_eq!(config.workspace_log_keep_instances("demo"), 9);
+        assert_eq!(
+            config.workspace_log_defaults("demo").expect("log settings"),
+            ("app:err".to_string(), 3)
+        );
+    }
+
+    #[test]
     fn resolves_process_names_with_suffix() {
         let items = vec![
             ProcessConfig {
@@ -573,6 +694,29 @@ workspaces:
         let resolved = resolve_processes(&items).expect("resolve");
         assert_eq!(resolved[0].name, "npm");
         assert_eq!(resolved[1].name, "npm-2");
+    }
+
+    #[test]
+    fn generated_process_names_do_not_collide_with_explicit_suffixes() {
+        let items: Vec<_> = ["app", "app", "app-2", "app", "app-2", "app-2-2"]
+            .into_iter()
+            .map(|name| ProcessConfig {
+                name: Some(name.to_string()),
+                cmd: vec!["echo".to_string()],
+                default_log: false,
+                default_stream: None,
+            })
+            .collect();
+        let resolved = resolve_processes(&items).expect("resolve colliding names");
+        let names: Vec<_> = resolved
+            .iter()
+            .map(|process| process.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["app", "app-2", "app-2-2", "app-3", "app-2-3", "app-2-2-2"]
+        );
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), names.len());
     }
 
     #[test]

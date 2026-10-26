@@ -12,7 +12,7 @@ use crate::env;
 use crate::logs;
 use crate::paths;
 use crate::process;
-use crate::state::{self, CurrentState, CurrentStatus};
+use crate::state::{self, CurrentState, CurrentStatus, PidsFile};
 
 pub fn run(cli: Cli) -> Result<()> {
     match (cli.workspace, cli.command) {
@@ -44,6 +44,7 @@ fn select_workspace(target: &str) -> Result<()> {
 
     state::save_current(&CurrentState {
         workspace: workspace.name.clone(),
+        workspace_path: Some(workspace.path.clone()),
         instance_id: None,
         started_at: Utc::now(),
         status: CurrentStatus::Stopped,
@@ -74,7 +75,8 @@ fn up_current() -> Result<()> {
     }
 
     let config = Config::load()?;
-    let workspace = config.resolve_workspace(&current.workspace)?;
+    let workspace =
+        config.resolve_current_workspace(&current.workspace, current.workspace_path.as_deref())?;
     start_workspace_instance(&workspace, "started")
 }
 
@@ -84,13 +86,21 @@ fn start_workspace_instance(workspace: &ResolvedWorkspace, action: &str) -> Resu
 
     let pids = process::start_workspace(workspace, &instance_id, &env_map)?;
 
-    state::save_pids(&pids)?;
-    state::save_current(&CurrentState {
-        workspace: workspace.name.clone(),
-        instance_id: Some(instance_id),
-        started_at: Utc::now(),
-        status: CurrentStatus::Running,
-    })?;
+    let saved = state::save_pids(&pids).and_then(|()| {
+        state::save_current(&CurrentState {
+            workspace: workspace.name.clone(),
+            workspace_path: Some(workspace.path.clone()),
+            instance_id: Some(instance_id),
+            started_at: Utc::now(),
+            status: CurrentStatus::Running,
+        })
+    });
+    if let Err(err) = saved {
+        if let Err(stop_err) = process::stop_workspace(&pids, workspace.grace_seconds) {
+            return Err(err).context(format!("startup rollback also failed: {stop_err:#}"));
+        }
+        return Err(err);
+    }
 
     println!("{action} workspace `{}`", workspace.name);
     traxer::info!("{action} workspace `{}`", workspace.name);
@@ -127,14 +137,8 @@ fn list_workspaces() -> Result<()> {
 }
 
 fn down_current(config: Option<&Config>) -> Result<()> {
-    let current = match state::load_current() {
-        Ok(value) => value,
-        Err(err) => {
-            traxer::warn!("current state is invalid, clearing it: {err:#}");
-            state::clear_current()?;
-            return Ok(());
-        }
-    };
+    let current = state::load_current()
+        .context("cannot stop workspace: current state is unreadable; state was preserved")?;
 
     let Some(mut current) = current else {
         println!("no current workspace");
@@ -146,31 +150,21 @@ fn down_current(config: Option<&Config>) -> Result<()> {
         return Ok(());
     }
 
-    let Some(instance_id) = current.instance_id.clone() else {
-        println!("workspace `{}` has no running instance", current.workspace);
-        save_current_stopped(&mut current, false)?;
-        return Ok(());
-    };
-
-    let pids_file = match state::load_pids(&instance_id) {
-        Ok(value) => value,
-        Err(err) => {
-            traxer::warn!(
-                "pids file for instance `{}` could not be read; marking workspace as stopped: {err:#}",
-                instance_id
-            );
-            save_current_stopped(&mut current, true)?;
-            println!(
-                "workspace `{}` runtime metadata is unreadable; marked as stopped",
-                current.workspace
-            );
-            return Ok(());
-        }
-    };
+    let instance_id = current.instance_id.clone().with_context(|| {
+        format!(
+            "running workspace `{}` has no instance id; cannot verify process state; state was preserved",
+            current.workspace
+        )
+    })?;
+    let pids_file = load_current_pids(&current, &instance_id).with_context(|| {
+        format!(
+            "cannot stop instance `{instance_id}`: runtime metadata is unreadable or inconsistent; state was preserved"
+        )
+    })?;
 
     let grace_seconds = resolve_grace_seconds(config, &current.workspace);
     process::stop_workspace(&pids_file, grace_seconds)?;
-    save_current_stopped(&mut current, false)?;
+    save_current_stopped(&mut current)?;
     let keep_instances = resolve_keep_instances(config, &current.workspace);
     cleanup_workspace_instances(&current.workspace, keep_instances, Some(&instance_id))?;
 
@@ -181,23 +175,16 @@ fn down_current(config: Option<&Config>) -> Result<()> {
 }
 
 fn logs_current(target: Option<String>, lines: Option<usize>, follow: bool) -> Result<()> {
-    let mut current = load_current_reconciled()?.context("no current workspace")?;
+    let current = load_current_reconciled()?.context("no current workspace")?;
     let Some(instance_id) = current.instance_id.clone() else {
         println!("no running instance");
         return Ok(());
     };
-    let pids = match state::load_pids(&instance_id) {
-        Ok(value) => value,
-        Err(err) => {
-            traxer::warn!(
-                "pids file for instance `{}` could not be read while showing logs; marking workspace as stopped: {err:#}",
-                instance_id
-            );
-            save_current_stopped(&mut current, true)?;
-            println!("no running instance");
-            return Ok(());
-        }
-    };
+    let pids = load_current_pids(&current, &instance_id).with_context(|| {
+        format!(
+            "cannot show logs for instance `{instance_id}`: runtime metadata is unreadable or inconsistent; state was preserved"
+        )
+    })?;
 
     let (default_target, default_lines) = resolve_log_defaults(&current.workspace, &pids);
 
@@ -222,15 +209,21 @@ fn handle_follow_outcome(outcome: logs::FollowOutcome) -> Result<()> {
 }
 
 fn exec_current(cmd: Vec<String>) -> Result<()> {
-    let current = load_current_reconciled()?.context("no current workspace")?;
+    let (program, args) = cmd.split_first().context("exec requires a command")?;
+    let mut current = load_current_reconciled()?.context("no current workspace")?;
 
     let config = Config::load()?;
-    let workspace = config.resolve_workspace(&current.workspace)?;
+    let workspace =
+        config.resolve_current_workspace(&current.workspace, current.workspace_path.as_deref())?;
     let env_map = env::build_environment(&workspace)?;
+    if current.workspace_path.is_none() {
+        current.workspace_path = Some(workspace.path.clone());
+        state::save_current(&current)?;
+    }
 
-    let mut command = ProcessCommand::new(&cmd[0]);
+    let mut command = ProcessCommand::new(program);
     command
-        .args(&cmd[1..])
+        .args(args)
         .current_dir(&workspace.path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -251,6 +244,9 @@ fn exec_current(cmd: Vec<String>) -> Result<()> {
 
 fn print_current_overview(current: &CurrentState) {
     println!("Current workspace: {}", current.workspace);
+    if let Some(path) = &current.workspace_path {
+        println!("Workspace path: {}", path.display());
+    }
     println!("State: {}", current.status.as_str());
     println!(
         "Instance ID: {}",
@@ -259,18 +255,15 @@ fn print_current_overview(current: &CurrentState) {
     println!("Started at: {}", current.started_at);
 }
 
-fn print_process_overview(instance_id: &str) -> Result<()> {
-    let pids = match state::load_pids(instance_id) {
-        Ok(value) => value,
-        Err(err) => {
-            println!("Processes: unavailable ({err:#})");
-            traxer::warn!("processes are unavailable: {err:#}");
-            return Ok(());
-        }
-    };
+fn print_process_overview(current: &CurrentState, instance_id: &str) -> Result<()> {
+    let pids = load_current_pids(current, instance_id).with_context(|| {
+        format!(
+            "cannot inspect processes for instance `{instance_id}`: runtime metadata is unreadable"
+        )
+    })?;
 
     for entry in pids.entries {
-        let status = if process::is_pid_running(entry.pid) {
+        let status = if process::is_process_tree_running(&entry) {
             "running"
         } else {
             "stopped"
@@ -283,14 +276,7 @@ fn print_process_overview(instance_id: &str) -> Result<()> {
 }
 
 fn status_current() -> Result<()> {
-    let current = match load_current_reconciled() {
-        Ok(value) => value,
-        Err(err) => {
-            println!("Current: invalid ({err:#})");
-            traxer::warn!("current state is invalid: {err:#}");
-            return Ok(());
-        }
-    };
+    let current = load_current_reconciled().context("cannot determine workspace status")?;
 
     let Some(current) = current else {
         println!("Current: none");
@@ -311,7 +297,7 @@ fn status_current() -> Result<()> {
         traxer::info!("status has no running instance");
         return Ok(());
     };
-    print_process_overview(instance_id)
+    print_process_overview(&current, instance_id)
 }
 
 fn load_current_reconciled() -> Result<Option<CurrentState>> {
@@ -323,73 +309,79 @@ fn load_current_reconciled() -> Result<Option<CurrentState>> {
         return Ok(Some(current));
     }
 
-    let Some(instance_id) = current.instance_id.clone() else {
-        save_current_stopped(&mut current, true)?;
-        return Ok(Some(current));
-    };
+    let instance_id = current.instance_id.clone().with_context(|| {
+        format!(
+            "running workspace `{}` has no instance id; cannot verify process state; state was preserved",
+            current.workspace
+        )
+    })?;
+    let pids = load_current_pids(&current, &instance_id).with_context(|| {
+        format!(
+            "cannot verify process state for instance `{instance_id}`: runtime metadata is unreadable or inconsistent; state was preserved"
+        )
+    })?;
 
-    let pids = match state::load_pids(&instance_id) {
-        Ok(pids) => pids,
-        Err(err) => {
-            traxer::warn!(
-                "failed to read pids for running instance `{}`; marking workspace as stopped: {err:#}",
-                instance_id
-            );
-            save_current_stopped(&mut current, true)?;
-            return Ok(Some(current));
-        }
-    };
-
-    let has_running_pid = pids
-        .entries
-        .iter()
-        .any(|entry| process::is_pid_running(entry.pid));
-    if !has_running_pid {
-        save_current_stopped(&mut current, false)?;
+    let has_running_process_tree = pids.entries.iter().any(process::is_process_tree_running);
+    if !has_running_process_tree {
+        save_current_stopped(&mut current)?;
     }
 
     Ok(Some(current))
 }
 
-fn save_current_stopped(current: &mut CurrentState, clear_instance: bool) -> Result<()> {
-    current.status = CurrentStatus::Stopped;
-    if clear_instance {
-        current.instance_id = None;
+fn load_current_pids(current: &CurrentState, instance_id: &str) -> Result<PidsFile> {
+    let pids = state::load_pids(instance_id)?;
+    if pids.instance_id != instance_id {
+        bail!(
+            "runtime metadata instance id does not match current instance `{instance_id}`; state was preserved"
+        );
     }
+    if pids.workspace != current.workspace {
+        bail!(
+            "runtime metadata workspace does not match current workspace `{}`; state was preserved",
+            current.workspace
+        );
+    }
+    if current.status == CurrentStatus::Running && pids.entries.is_empty() {
+        bail!(
+            "running instance `{instance_id}` has no process entries; cannot verify process state; state was preserved"
+        );
+    }
+    for entry in &pids.entries {
+        let invalid_pid = entry.pid <= 1;
+        #[cfg(unix)]
+        let invalid_pid = invalid_pid || i32::try_from(entry.pid).is_err();
+        if invalid_pid {
+            bail!(
+                "runtime metadata contains invalid pid {} for process `{}`; state was preserved",
+                entry.pid,
+                entry.name
+            );
+        }
+    }
+    Ok(pids)
+}
+
+fn save_current_stopped(current: &mut CurrentState) -> Result<()> {
+    current.status = CurrentStatus::Stopped;
     state::save_current(current)
 }
 
 fn resolve_grace_seconds(config: Option<&Config>, workspace_name: &str) -> u64 {
-    if let Some(config) = config {
-        if let Ok(workspace) = config.resolve_workspace(workspace_name) {
-            return workspace.grace_seconds;
-        }
-        return config.default_grace_seconds();
-    }
-
-    match Config::load() {
-        Ok(config) => match config.resolve_workspace(workspace_name) {
-            Ok(workspace) => workspace.grace_seconds,
-            Err(_) => config.default_grace_seconds(),
-        },
-        Err(_) => 5,
+    match config {
+        Some(config) => config.workspace_grace_seconds(workspace_name),
+        None => Config::load()
+            .map(|config| config.workspace_grace_seconds(workspace_name))
+            .unwrap_or(5),
     }
 }
 
 fn resolve_keep_instances(config: Option<&Config>, workspace_name: &str) -> usize {
-    if let Some(config) = config {
-        if let Ok(workspace) = config.resolve_workspace(workspace_name) {
-            return workspace.logs_keep_instances;
-        }
-        return config.default_log_keep_instances();
-    }
-
-    match Config::load() {
-        Ok(config) => match config.resolve_workspace(workspace_name) {
-            Ok(workspace) => workspace.logs_keep_instances,
-            Err(_) => config.default_log_keep_instances(),
-        },
-        Err(_) => 20,
+    match config {
+        Some(config) => config.workspace_log_keep_instances(workspace_name),
+        None => Config::load()
+            .map(|config| config.workspace_log_keep_instances(workspace_name))
+            .unwrap_or(20),
     }
 }
 
@@ -408,9 +400,8 @@ fn resolve_log_defaults(workspace_name: &str, pids: &crate::state::PidsFile) -> 
 
     let default_lines = config.default_log_lines();
 
-    let workspace: Option<ResolvedWorkspace> = config.resolve_workspace(workspace_name).ok();
-    if let Some(workspace) = workspace {
-        return (workspace.logs_default, workspace.logs_lines);
+    if let Ok(defaults) = config.workspace_log_defaults(workspace_name) {
+        return defaults;
     }
 
     let fallback_target = pids
@@ -480,7 +471,7 @@ fn cleanup_workspace_instances(
         });
     }
 
-    candidates.sort_by(|a, b| b.modified.cmp(&a.modified));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.modified));
 
     let mut kept = 0usize;
     for instance in candidates {

@@ -100,6 +100,28 @@ If empty, target is resolved from process settings (see resolution order below).
 - Type: string
 - Required: yes
 - Constraint: must exist and must be a directory
+- Absolute paths are recommended when a workspace name should always refer to the same checkout.
+- A relative path is resolved against the directory where you run `wsx select <name>`
+  or `wsx <name>`, not against the config directory.
+- Selection saves the canonical absolute workspace directory in `current.json`
+  (`workspace_path`). This also resolves symlinks at selection time.
+- Subsequent `up` and `exec` use that saved directory, even after you change directories
+  or edit this configured path. Run `select` again (or `wsx <name>`) to choose a new path.
+- Relative dotenv paths and `.envrc` are resolved within the selected workspace
+  directory. Absolute dotenv paths are used unchanged. Started applications use
+  the selected workspace as their working directory for their own relative file I/O.
+- On Windows, prefer absolute executable paths and absolute `PATH` entries:
+  executable lookup for a relative `cmd[0]` can differ from the child's working directory.
+- `~` and environment variables in `path` are not expanded.
+
+For example, selecting `path: ./project` from `/home/me/dev` saves
+`/home/me/dev/project`. Later running `wsx exec` from `/tmp` still uses that project.
+
+**Existing state:** Older `current.json` files may not contain `workspace_path`.
+An absolute configured path can be migrated safely by `up` or `exec`. For a relative
+configured path, run `wsx select <name>` again from the intended directory before
+`up` or `exec`; wsx will not guess the original selection directory. `down` and
+`status` remain available. No config file is rewritten automatically.
 
 ### `stop.grace_seconds` (optional)
 
@@ -201,19 +223,27 @@ If the selected process has `default_stream`, it becomes `<name>:<stream>`.
 
 1. OS environment
 2. dotenv files (in configured order, last write wins)
-3. `.envrc` (when enabled, final overwrite)
+3. `.envrc` (when enabled, its resulting environment replaces the previous layer)
 
 ### `.envrc` execution
 
-- Unix: `sh -c "set -a; . ./.envrc; env"`
-- Windows: `bash -c "set -a; source ./.envrc; env"`
+- Unix: a non-login `sh -c` sources `.envrc` with `set -a`.
+- Windows: a non-login `bash -c` sources `.envrc` with `set -a`.
+- After successful sourcing, `wsx` captures `env -0` output after a unique marker.
+  `unset` removes inherited OS/dotenv variables, multiline and empty values are
+  preserved, and text printed by `.envrc` is not interpreted as environment data.
 
 Notes:
 
 - `.envrc` is evaluated with a non-login shell (`-c`) for deterministic PATH/toolchain behavior.
 - If `envrc: true` but `.envrc` is missing, it is skipped.
 - On Windows, if `bash` is not found, `.envrc` is skipped with warning.
-- If `.envrc` execution fails, workspace startup fails.
+- `.envrc` evaluation requires an `env` command supporting `-0` (GNU coreutils and
+  current macOS provide it). Unsupported or malformed output fails startup rather
+  than applying a partial environment.
+- If sourcing `.envrc` returns a non-zero status, workspace startup fails.
+- No implicit `set -e` is applied: `.envrc` retains normal shell status rules.
+  A failed command followed by a successful command may still return success.
 
 ## Common Errors
 

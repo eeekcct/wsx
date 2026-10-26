@@ -89,6 +89,13 @@ mod linux_e2e {
                 .expect("failed to execute wsx")
         }
 
+        fn run_from(&self, args: &[&str], cwd: &Path, extra_env: &[(&str, &str)]) -> Output {
+            self.build_command(args, extra_env)
+                .current_dir(cwd)
+                .output()
+                .expect("failed to execute wsx from test directory")
+        }
+
         fn spawn_with_pty(&self, args: &[&str], extra_env: &[(&str, &str)]) -> PtySession {
             PtySession::spawn(self, args, extra_env)
         }
@@ -395,6 +402,39 @@ mod linux_e2e {
 
     fn pid_exists(pid: u32) -> bool {
         Path::new("/proc").join(pid.to_string()).exists()
+    }
+
+    // Match only processes in this test's unique directory. Unlike a PID-file
+    // handshake, this also handles rollback before a child gets to run any code.
+    fn workspace_process_pids(workspace: &Path) -> Vec<u32> {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+                (fs::read_link(entry.path().join("cwd")).ok()?.as_path() == workspace)
+                    .then_some(pid)
+            })
+            .collect()
+    }
+
+    struct WorkspaceProcessCleanup(PathBuf);
+
+    impl Drop for WorkspaceProcessCleanup {
+        fn drop(&mut self) {
+            for pid in workspace_process_pids(&self.0) {
+                if let Ok(raw_pid) = i32::try_from(pid) {
+                    let _ = kill(Pid::from_raw(-raw_pid), Signal::SIGKILL);
+                    let _ = kill(Pid::from_raw(raw_pid), Signal::SIGKILL);
+                }
+            }
+        }
+    }
+
+    fn process_is_live(pid: u32) -> bool {
+        read_proc_state(pid).is_some_and(|state| !matches!(state, 'Z' | 'X'))
     }
 
     fn read_proc_state(pid: u32) -> Option<char> {
@@ -1945,5 +1985,502 @@ workspaces:
         let result = env.run(&["unknown"]);
         assert_failure(&result);
         assert!(stderr(&result).contains("workspace `unknown` is not defined"));
+    }
+
+    #[test]
+    fn absolute_workspace_context_is_independent_of_invocation_directory() {
+        let env = TestEnv::new("outside-workspace-context");
+        let demo = env.create_workspace("日本語 workspace with spaces");
+        let _cleanup = WorkspaceProcessCleanup(demo.clone());
+        let outside = env.create_workspace("unrelated caller");
+        let other = env.create_workspace("another caller 日本語");
+        let external_dotenv = env.home_dir.join("absolute env file");
+        fs::write(&external_dotenv, "WSX_CONTEXT_ABS_ONLY=absolute-dotenv\n")
+            .expect("write absolute dotenv");
+        fs::write(
+            demo.join(".env"),
+            "WSX_CONTEXT_PRIORITY=dotenv-first\nWSX_CONTEXT_DOT_ONLY=dotenv\n",
+        )
+        .expect("write dotenv");
+        fs::write(
+            demo.join(".env.local"),
+            "WSX_CONTEXT_PRIORITY=dotenv-second\n",
+        )
+        .expect("write second dotenv");
+        fs::write(demo.join("relative.txt"), "workspace-relative")
+            .expect("write workspace-relative input");
+        fs::write(
+            demo.join(".envrc"),
+            r#"export WSX_CONTEXT_PRIORITY=envrc
+export WSX_CONTEXT_RC_ROOT="$PWD"
+export WSX_CONTEXT_RELATIVE="$(cat relative.txt)"
+"#,
+        )
+        .expect("write envrc");
+        fs::write(outside.join(".env"), "WSX_CONTEXT_PRIORITY=wrong-caller\n")
+            .expect("write unrelated dotenv");
+        fs::write(
+            outside.join(".envrc"),
+            "touch caller-envrc-was-run\nexit 43\n",
+        )
+        .expect("write unrelated envrc");
+        let probe = demo.join("probe script.sh");
+        fs::write(
+            &probe,
+            r#"#!/bin/sh
+if [ "$1" = boot ]; then pwd > boot-cwd.txt; fi
+printf '%s\n' "$PWD" "$WSX_CONTEXT_PRIORITY" "$WSX_CONTEXT_DOT_ONLY" "$WSX_CONTEXT_ABS_ONLY" "$WSX_CONTEXT_OS_ONLY" "$WSX_CONTEXT_RC_ROOT" "$WSX_CONTEXT_RELATIVE" "$@"
+"#,
+        )
+        .expect("write relative executable");
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755))
+            .expect("make probe executable");
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+workspaces:
+  demo:
+    path: {}
+    env:
+      dotenv: [.env, .env.local, {}]
+      envrc: true
+    processes:
+      - name: probe
+        cmd: ["./probe script.sh", "boot"]
+      - name: sleeper
+        cmd: ["/bin/sleep", "60"]
+"#,
+            yaml_path(&demo),
+            yaml_path(&external_dotenv),
+        ));
+        let os_env = [
+            ("WSX_CONTEXT_PRIORITY", "os"),
+            ("WSX_CONTEXT_OS_ONLY", "os"),
+        ];
+
+        let selected = env.run_from(&["select", "demo"], &outside, &os_env);
+        assert_success(&selected);
+        assert!(current_instance_id(&env).is_none());
+        assert!(!demo.join("boot-cwd.txt").exists());
+
+        let exec = env.run_from(
+            &[
+                "exec",
+                "./probe script.sh",
+                "argument with spaces",
+                "日本語",
+            ],
+            &outside,
+            &os_env,
+        );
+        assert_success(&exec);
+        assert_eq!(
+            stdout(&exec),
+            format!(
+                "{}\nenvrc\ndotenv\nabsolute-dotenv\nos\n{}\nworkspace-relative\nargument with spaces\n日本語\n",
+                demo.display(),
+                demo.display(),
+            )
+        );
+        assert!(!outside.join("caller-envrc-was-run").exists());
+
+        let up = env.run_from(&["up"], &outside, &os_env);
+        assert_success(&up);
+        assert_eq!(
+            fs::read_to_string(demo.join("boot-cwd.txt"))
+                .expect("read startup cwd")
+                .trim(),
+            demo.to_string_lossy(),
+        );
+        let instance_id = current_instance_id(&env).expect("running instance");
+        let sleeper = current_process_pid(&env, "sleeper").expect("sleeper pid");
+        assert!(process_is_live(sleeper));
+        assert_success(&env.run_from(&["up"], &other, &os_env));
+        assert_eq!(
+            current_instance_id(&env).as_deref(),
+            Some(instance_id.as_str())
+        );
+        let list = env.run_from(&["list"], &other, &os_env);
+        assert_success(&list);
+        assert_stdout_contains_all(&list, &["* demo"]);
+        let status = env.run_from(&["status"], &other, &os_env);
+        assert_success(&status);
+        assert_stdout_contains_all(&status, &["State: running"]);
+        let logs = env.run_from(&["logs", "probe:out", "--no-follow"], &other, &os_env);
+        assert_success(&logs);
+        assert_stdout_contains_all(&logs, &["workspace-relative", "envrc"]);
+        assert_success(&env.run_from(&["down"], &other, &os_env));
+        assert!(!process_is_live(sleeper));
+        assert_success(&env.run_from(&["down"], &outside, &os_env));
+        assert_success(&env.run_from(&["demo"], &other, &os_env));
+        assert_success(&env.run_from(&["down"], &outside, &os_env));
+    }
+
+    #[test]
+    fn log_open_failure_stops_previously_started_processes() {
+        let env = TestEnv::new("log-open-rollback");
+        let demo = env.create_workspace("demo");
+        let _cleanup = WorkspaceProcessCleanup(demo.clone());
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: first
+        cmd: ["/bin/sleep", "60"]
+      - name: missing/child
+        cmd: ["/bin/sleep", "60"]
+"#,
+            yaml_path(&demo),
+        ));
+        let output = env.run(&["demo"]);
+        assert_failure(&output);
+        assert_stderr_contains(&output, "failed to open");
+        assert_stderr_contains(&output, "missing/child.out.log");
+        assert!(current_meta(&env).is_none());
+        // Reaching the second process's log file means the first spawn succeeded.
+        // Check the unique cwd, not a child-written PID file that successful
+        // rollback can prevent from ever being written.
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                workspace_process_pids(&demo)
+                    .into_iter()
+                    .all(|pid| !process_is_live(pid))
+            }),
+            "a child survived failure to open the next process's log file"
+        );
+    }
+
+    #[test]
+    fn current_state_write_failure_stops_started_processes() {
+        let env = TestEnv::new("current-write-rollback");
+        let demo = env.create_workspace("demo");
+        let _cleanup = WorkspaceProcessCleanup(demo.clone());
+        // This runs after reading the old current state but before persisting the
+        // newly spawned instance, deterministically making that write fail.
+        fs::write(
+            demo.join(".envrc"),
+            "mkdir \"$HOME/.config/wsx/current.json\"\n",
+        )
+        .expect("write envrc failure fixture");
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+workspaces:
+  demo:
+    path: {}
+    env:
+      envrc: true
+    processes:
+      - name: sleeper
+        cmd: ["/bin/sleep", "60"]
+"#,
+            yaml_path(&demo),
+        ));
+        let output = env.run(&["demo"]);
+        assert_failure(&output);
+        assert_stderr_contains(&output, "failed to write");
+        assert_stderr_contains(&output, "current.json");
+        assert!(env.wsx_home().join("current.json").is_dir());
+        let pid_files = fs::read_dir(env.wsx_home().join("instances"))
+            .expect("read instances")
+            .flatten()
+            .map(|entry| entry.path().join("pids.json"))
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pid_files.len(),
+            1,
+            "spawn should have reached metadata persistence"
+        );
+        let pids: PidsMeta = serde_json::from_str(
+            &fs::read_to_string(&pid_files[0]).expect("read persisted pid metadata"),
+        )
+        .expect("parse pid metadata");
+        assert_eq!(pids.entries.len(), 1);
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                pids.entries.iter().all(|entry| !process_is_live(entry.pid))
+            }),
+            "a child survived failure to persist current state"
+        );
+    }
+
+    fn write_pinning_project(path: &Path, identity: &str) {
+        fs::create_dir_all(path).expect("create pinning project");
+        fs::write(path.join("identity"), identity).expect("write pinning identity");
+        fs::write(path.join(".env"), format!("WSX_PIN_DOTENV={identity}\n"))
+            .expect("write pinning dotenv");
+        fs::write(
+            path.join(".envrc"),
+            "export WSX_PIN_ENVRC=\"$(cat identity)\"\n",
+        )
+        .expect("write pinning envrc");
+        let probe = path.join("probe.sh");
+        fs::write(
+            &probe,
+            r#"#!/bin/sh
+printf '%s\n' "$PWD" "$WSX_PIN_DOTENV" "$WSX_PIN_ENVRC" "$@"
+"#,
+        )
+        .expect("write pinning probe");
+        fs::set_permissions(probe, fs::Permissions::from_mode(0o755))
+            .expect("make pinning probe executable");
+    }
+
+    fn pinning_config(path: &Path) -> String {
+        format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+workspaces:
+  demo:
+    path: {}
+    env:
+      envrc: true
+    processes:
+      - name: probe
+        cmd: ["./probe.sh", "boot"]
+      - name: sleeper
+        cmd: ["/bin/sleep", "60"]
+"#,
+            yaml_path(path)
+        )
+    }
+
+    fn pinned_workspace_path(env: &TestEnv) -> Option<PathBuf> {
+        let current: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(env.wsx_home().join("current.json"))
+                .expect("read current state for pinned path"),
+        )
+        .expect("parse current state for pinned path");
+        current["workspace_path"].as_str().map(PathBuf::from)
+    }
+
+    fn assert_pinned_exec(env: &TestEnv, caller: &Path, expected: &Path, identity: &str) {
+        let output = env.run_from(&["exec", "./probe.sh", "argument 日本語"], caller, &[]);
+        assert_success(&output);
+        assert_eq!(
+            stdout(&output),
+            format!(
+                "{}\n{identity}\n{identity}\nargument 日本語\n",
+                expected.display()
+            )
+        );
+    }
+
+    #[test]
+    fn relative_selection_stays_pinned_until_reselected() {
+        let env = TestEnv::new("selection-cwd-pinning");
+        let caller_a = env.create_workspace("caller A");
+        let caller_b = env.create_workspace("caller B 日本語");
+        let unrelated = env.create_workspace("unrelated");
+        let project_a = caller_a.join("project");
+        let project_b = caller_b.join("project");
+        let _cleanup_a = WorkspaceProcessCleanup(project_a.clone());
+        let _cleanup_b = WorkspaceProcessCleanup(project_b.clone());
+        write_pinning_project(&project_a, "project-a");
+        write_pinning_project(&project_b, "project-b");
+        env.write_config(&pinning_config(Path::new("project")));
+
+        assert_success(&env.run_from(&["select", "demo"], &caller_a, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a.clone()));
+        assert_pinned_exec(&env, &caller_b, &project_a, "project-a");
+        assert_success(&env.run_from(&["up"], &caller_b, &[]));
+        let sleeper = current_process_pid(&env, "sleeper").expect("first sleeper pid");
+        assert!(process_is_live(sleeper));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a.clone()));
+        assert_success(&env.run_from(&["down"], &unrelated, &[]));
+        assert!(!process_is_live(sleeper));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a.clone()));
+        assert_pinned_exec(&env, &unrelated, &project_a, "project-a");
+
+        assert_success(&env.run_from(&["select", "demo"], &caller_b, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_b.clone()));
+        assert_pinned_exec(&env, &caller_a, &project_b, "project-b");
+        assert_success(&env.run_from(&["demo"], &caller_a, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a.clone()));
+        assert_pinned_exec(&env, &caller_b, &project_a, "project-a");
+        let first = current_process_pid(&env, "sleeper").expect("A sleeper before switching");
+        // Reusing the same workspace name is still an explicit selection: stop
+        // A's running instance and resolve the configured relative path from B.
+        assert_success(&env.run_from(&["demo"], &caller_b, &[]));
+        assert!(!process_is_live(first));
+        assert_eq!(pinned_workspace_path(&env), Some(project_b.clone()));
+        assert_pinned_exec(&env, &caller_a, &project_b, "project-b");
+        let second = current_process_pid(&env, "sleeper").expect("B sleeper before selecting");
+        assert_success(&env.run_from(&["select", "demo"], &caller_a, &[]));
+        assert!(!process_is_live(second));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a.clone()));
+        assert!(current_instance_id(&env).is_none());
+        assert_pinned_exec(&env, &caller_b, &project_a, "project-a");
+        assert_success(&env.run_from(&["down"], &caller_b, &[]));
+    }
+
+    #[test]
+    fn pinned_selection_ignores_config_path_edits_and_preserves_path_on_failed_start() {
+        let env = TestEnv::new("pinning-config-edits");
+        let caller_a = env.create_workspace("A");
+        let caller_b = env.create_workspace("B");
+        let project_a = caller_a.join("project");
+        let project_b = caller_b.join("project");
+        let _cleanup_a = WorkspaceProcessCleanup(project_a.clone());
+        let _cleanup_b = WorkspaceProcessCleanup(project_b.clone());
+        write_pinning_project(&project_a, "project-a");
+        write_pinning_project(&project_b, "project-b");
+        env.write_config(&pinning_config(Path::new("project")));
+        assert_success(&env.run_from(&["select", "demo"], &caller_a, &[]));
+
+        // Edits are picked up on a deliberate selection, not implicitly by exec/up.
+        env.write_config(&pinning_config(&project_b));
+        assert_pinned_exec(&env, &caller_b, &project_a, "project-a");
+        env.write_config(&pinning_config(Path::new("does-not-exist")));
+        assert_pinned_exec(&env, &caller_b, &project_a, "project-a");
+        assert_success(&env.run_from(&["up"], &caller_b, &[]));
+        assert_success(&env.run_from(&["down"], &caller_b, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a.clone()));
+
+        let bad_spawn = pinning_config(&project_b).replace(
+            "[\"/bin/sleep\", \"60\"]",
+            "[\"/wsx-test-missing-executable\"]",
+        );
+        env.write_config(&bad_spawn);
+        assert_failure(&env.run_from(&["up"], &caller_b, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a.clone()));
+        assert_eq!(
+            current_meta(&env).and_then(|meta| meta.status),
+            Some("stopped".into())
+        );
+
+        // A valid new target with failing environment must not replace the old selection.
+        env.write_config(&pinning_config(&project_b));
+        fs::write(project_b.join(".envrc"), "exit 23\n").expect("write failing new target envrc");
+        assert_failure(&env.run_from(&["demo"], &caller_b, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a.clone()));
+        assert_pinned_exec(&env, &caller_b, &project_a, "project-a");
+    }
+
+    #[test]
+    fn missing_pinned_path_and_config_fail_safely_without_retargeting() {
+        let env = TestEnv::new("pinning-missing-inputs");
+        let caller_a = env.create_workspace("A");
+        let caller_b = env.create_workspace("B");
+        let project_a = caller_a.join("project");
+        let project_b = caller_b.join("project");
+        let _cleanup_a = WorkspaceProcessCleanup(project_a.clone());
+        let _cleanup_b = WorkspaceProcessCleanup(project_b.clone());
+        write_pinning_project(&project_a, "project-a");
+        write_pinning_project(&project_b, "project-b");
+        env.write_config(&pinning_config(Path::new("project")));
+        assert_success(&env.run_from(&["select", "demo"], &caller_a, &[]));
+        fs::rename(&project_a, caller_a.join("moved-project")).expect("move selected project");
+        for args in [vec!["exec", "./probe.sh"], vec!["up"]] {
+            let output = env.run_from(&args, &caller_b, &[]);
+            assert_failure(&output);
+            assert_stderr_contains(&output, "workspace path does not exist");
+        }
+        assert_eq!(pinned_workspace_path(&env), Some(project_a));
+        assert_success(&env.run_from(&["status"], &caller_b, &[]));
+        assert_success(&env.run_from(&["down"], &caller_b, &[]));
+
+        assert_success(&env.run_from(&["select", "demo"], &caller_b, &[]));
+        assert_pinned_exec(&env, &caller_a, &project_b, "project-b");
+        // Removing a workspace definition prevents starting/exec, but not safe stop.
+        env.write_config(&pinning_config(Path::new("project")).replace("  demo:", "  other:"));
+        assert_failure(&env.run_from(&["exec", "./probe.sh"], &caller_a, &[]));
+        assert_failure(&env.run_from(&["up"], &caller_a, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_b.clone()));
+        env.write_config(&pinning_config(Path::new("project")));
+        assert_success(&env.run_from(&["up"], &caller_a, &[]));
+        let sleeper = current_process_pid(&env, "sleeper").expect("sleeper before missing config");
+        fs::remove_file(env.wsx_home().join("config.yaml")).expect("remove config");
+        assert_failure(&env.run_from(&["exec", "./probe.sh"], &caller_a, &[]));
+        assert_success(&env.run_from(&["status"], &caller_a, &[]));
+        assert_success(&env.run_from(&["down"], &caller_a, &[]));
+        assert!(!process_is_live(sleeper));
+        assert_failure(&env.run_from(&["up"], &caller_a, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_b));
+    }
+
+    #[test]
+    fn legacy_current_path_migration_requires_reselection_for_relative_config() {
+        let env = TestEnv::new("pinning-legacy-state");
+        let caller_a = env.create_workspace("A");
+        let caller_b = env.create_workspace("B");
+        let project_a = caller_a.join("project");
+        let project_b = caller_b.join("project");
+        let _cleanup_a = WorkspaceProcessCleanup(project_a.clone());
+        let _cleanup_b = WorkspaceProcessCleanup(project_b.clone());
+        write_pinning_project(&project_a, "project-a");
+        write_pinning_project(&project_b, "project-b");
+        let write_legacy_state = || {
+            fs::write(
+                env.wsx_home().join("current.json"),
+                r#"{"workspace":"demo","instance_id":null,"started_at":"2025-01-01T00:00:00Z","status":"stopped"}"#,
+            )
+            .expect("write legacy current state");
+        };
+        env.write_config(&pinning_config(&project_a));
+        write_legacy_state();
+        assert_eq!(pinned_workspace_path(&env), None);
+        assert_pinned_exec(&env, &caller_b, &project_a, "project-a");
+        assert_success(&env.run_from(&["up"], &caller_b, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a));
+        assert_success(&env.run_from(&["down"], &caller_b, &[]));
+
+        env.write_config(&pinning_config(Path::new("project")));
+        write_legacy_state();
+        for args in [vec!["exec", "./probe.sh"], vec!["up"]] {
+            let output = env.run_from(&args, &caller_b, &[]);
+            assert_failure(&output);
+            assert_stderr_contains(&output, "select");
+        }
+        assert_eq!(pinned_workspace_path(&env), None);
+        assert_success(&env.run_from(&["status"], &caller_b, &[]));
+        assert_success(&env.run_from(&["down"], &caller_b, &[]));
+        assert_success(&env.run_from(&["select", "demo"], &caller_b, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_b.clone()));
+        assert_pinned_exec(&env, &caller_a, &project_b, "project-b");
+    }
+
+    #[test]
+    fn parent_relative_paths_and_symlink_targets_are_pinned_at_selection() {
+        let env = TestEnv::new("parent-relative-symlink-pinning");
+        let parent = env.create_workspace("parent 日本語");
+        let caller = parent.join("launcher");
+        fs::create_dir(&caller).expect("create launcher directory");
+        let other = env.create_workspace("unrelated caller");
+        let project_a = parent.join("project");
+        let project_b = other.join("project");
+        let _cleanup_a = WorkspaceProcessCleanup(project_a.clone());
+        let _cleanup_b = WorkspaceProcessCleanup(project_b.clone());
+        write_pinning_project(&project_a, "project-a");
+        write_pinning_project(&project_b, "project-b");
+
+        env.write_config(&pinning_config(Path::new("../project")));
+        assert_success(&env.run_from(&["select", "demo"], &caller, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a.clone()));
+        assert_pinned_exec(&env, &other, &project_a, "project-a");
+
+        let alias = parent.join("workspace alias");
+        std::os::unix::fs::symlink(&project_a, &alias).expect("create workspace symlink");
+        env.write_config(&pinning_config(Path::new("../workspace alias")));
+        assert_success(&env.run_from(&["select", "demo"], &caller, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a.clone()));
+        fs::remove_file(&alias).expect("remove original symlink");
+        std::os::unix::fs::symlink(&project_b, &alias).expect("retarget workspace symlink");
+        assert_pinned_exec(&env, &other, &project_a, "project-a");
+        assert_success(&env.run_from(&["up"], &other, &[]));
+        assert_eq!(pinned_workspace_path(&env), Some(project_a));
+        let sleeper = current_process_pid(&env, "sleeper").expect("original target sleeper");
+        assert_success(&env.run_from(&["select", "demo"], &caller, &[]));
+        assert!(!process_is_live(sleeper));
+        assert_eq!(pinned_workspace_path(&env), Some(project_b.clone()));
+        assert_pinned_exec(&env, &caller, &project_b, "project-b");
     }
 }
