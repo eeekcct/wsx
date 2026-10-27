@@ -44,6 +44,7 @@ fn select_workspace(target: &str) -> Result<()> {
 
     state::save_current(&CurrentState {
         workspace: workspace.name.clone(),
+        workspace_path: Some(workspace.path.clone()),
         instance_id: None,
         started_at: Utc::now(),
         status: CurrentStatus::Stopped,
@@ -74,7 +75,8 @@ fn up_current() -> Result<()> {
     }
 
     let config = Config::load()?;
-    let workspace = config.resolve_workspace(&current.workspace)?;
+    let workspace =
+        config.resolve_current_workspace(&current.workspace, current.workspace_path.as_deref())?;
     start_workspace_instance(&workspace, "started")
 }
 
@@ -87,6 +89,7 @@ fn start_workspace_instance(workspace: &ResolvedWorkspace, action: &str) -> Resu
     state::save_pids(&pids)?;
     state::save_current(&CurrentState {
         workspace: workspace.name.clone(),
+        workspace_path: Some(workspace.path.clone()),
         instance_id: Some(instance_id),
         started_at: Utc::now(),
         status: CurrentStatus::Running,
@@ -222,11 +225,16 @@ fn handle_follow_outcome(outcome: logs::FollowOutcome) -> Result<()> {
 }
 
 fn exec_current(cmd: Vec<String>) -> Result<()> {
-    let current = load_current_reconciled()?.context("no current workspace")?;
+    let mut current = load_current_reconciled()?.context("no current workspace")?;
 
     let config = Config::load()?;
-    let workspace = config.resolve_workspace(&current.workspace)?;
+    let workspace =
+        config.resolve_current_workspace(&current.workspace, current.workspace_path.as_deref())?;
     let env_map = env::build_environment(&workspace)?;
+    if current.workspace_path.is_none() {
+        current.workspace_path = Some(workspace.path.clone());
+        state::save_current(&current)?;
+    }
 
     let mut command = ProcessCommand::new(&cmd[0]);
     command
@@ -251,6 +259,9 @@ fn exec_current(cmd: Vec<String>) -> Result<()> {
 
 fn print_current_overview(current: &CurrentState) {
     println!("Current workspace: {}", current.workspace);
+    if let Some(path) = &current.workspace_path {
+        println!("Workspace path: {}", path.display());
+    }
     println!("State: {}", current.status.as_str());
     println!(
         "Instance ID: {}",
@@ -360,36 +371,20 @@ fn save_current_stopped(current: &mut CurrentState, clear_instance: bool) -> Res
 }
 
 fn resolve_grace_seconds(config: Option<&Config>, workspace_name: &str) -> u64 {
-    if let Some(config) = config {
-        if let Ok(workspace) = config.resolve_workspace(workspace_name) {
-            return workspace.grace_seconds;
-        }
-        return config.default_grace_seconds();
-    }
-
-    match Config::load() {
-        Ok(config) => match config.resolve_workspace(workspace_name) {
-            Ok(workspace) => workspace.grace_seconds,
-            Err(_) => config.default_grace_seconds(),
-        },
-        Err(_) => 5,
+    match config {
+        Some(config) => config.workspace_grace_seconds(workspace_name),
+        None => Config::load()
+            .map(|config| config.workspace_grace_seconds(workspace_name))
+            .unwrap_or(5),
     }
 }
 
 fn resolve_keep_instances(config: Option<&Config>, workspace_name: &str) -> usize {
-    if let Some(config) = config {
-        if let Ok(workspace) = config.resolve_workspace(workspace_name) {
-            return workspace.logs_keep_instances;
-        }
-        return config.default_log_keep_instances();
-    }
-
-    match Config::load() {
-        Ok(config) => match config.resolve_workspace(workspace_name) {
-            Ok(workspace) => workspace.logs_keep_instances,
-            Err(_) => config.default_log_keep_instances(),
-        },
-        Err(_) => 20,
+    match config {
+        Some(config) => config.workspace_log_keep_instances(workspace_name),
+        None => Config::load()
+            .map(|config| config.workspace_log_keep_instances(workspace_name))
+            .unwrap_or(20),
     }
 }
 
@@ -408,9 +403,8 @@ fn resolve_log_defaults(workspace_name: &str, pids: &crate::state::PidsFile) -> 
 
     let default_lines = config.default_log_lines();
 
-    let workspace: Option<ResolvedWorkspace> = config.resolve_workspace(workspace_name).ok();
-    if let Some(workspace) = workspace {
-        return (workspace.logs_default, workspace.logs_lines);
+    if let Ok(defaults) = config.workspace_log_defaults(workspace_name) {
+        return defaults;
     }
 
     let fallback_target = pids
