@@ -103,6 +103,10 @@ Show runtime status.
 ## Notes
 
 - `wsx` state is stored under `~/.config/wsx`.
+- If running-state or PID metadata is unreadable or inconsistent, lifecycle commands fail
+  without deleting it or declaring the workspace stopped. Repair the metadata before
+  retrying; do not delete it while managed processes may still be running. This prevents
+  an uncertain state from silently permitting duplicate processes.
 - On Windows, if the current instance was started by an older `wsx` that did not persist
   job tracking metadata, `wsx down` can fail during force stop. Start a new instance with
   the current version to enable job-based force stop.
