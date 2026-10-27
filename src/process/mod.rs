@@ -159,7 +159,7 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
             // Try force-stop for every running entry in this snapshot before
             // deciding whether this attempt should fail.
             let force_errors = collect_force_stop_errors(running, force_stop_entry);
-            validate_force_errors_with(force_errors, is_pid_running)?;
+            validate_force_errors_with(force_errors, is_process_tree_running_pid)?;
             next_force_attempt_at = Instant::now() + Duration::from_secs(FORCE_RETRY_INTERVAL_SECS);
         }
 
@@ -180,7 +180,7 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
 }
 
 fn force_stop_entry(entry: &PidEntry) -> Result<()> {
-    force_stop_entry_with(entry, send_force_stop, is_pid_running)
+    force_stop_entry_with(entry, send_force_stop, is_process_tree_running_pid)
 }
 
 fn collect_force_stop_errors<'a, I, F>(
@@ -241,7 +241,7 @@ fn rollback_untracked_pid(pid: u32) {
     rollback_untracked_pid_with(
         pid,
         send_graceful_stop,
-        is_pid_running,
+        is_process_tree_running_pid,
         force_stop_untracked_pid,
     );
 }
@@ -292,7 +292,7 @@ fn running_entries(pids_file: &PidsFile) -> Vec<&PidEntry> {
     pids_file
         .entries
         .iter()
-        .filter(|entry| is_pid_running(entry.pid))
+        .filter(|entry| is_process_tree_running(entry))
         .collect()
 }
 
@@ -305,6 +305,21 @@ pub fn is_pid_running(pid: u32) -> bool {
             ProcessStatus::Zombie | ProcessStatus::Dead
         ),
         None => false,
+    }
+}
+
+pub fn is_process_tree_running(entry: &PidEntry) -> bool {
+    is_process_tree_running_pid(entry.pid)
+}
+
+fn is_process_tree_running_pid(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unix::is_process_group_running(pid)
+    }
+    #[cfg(windows)]
+    {
+        is_pid_running(pid)
     }
 }
 

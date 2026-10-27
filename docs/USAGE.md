@@ -99,6 +99,8 @@ Show runtime status.
 - Current state (`running` or `stopped`)
 - Current instance id (`(none)` when no running instance) and start time
 - Per-process pid and `running`/`stopped`
+- On Unix, a workspace remains `running` while any managed process-group member is alive,
+  even after its launcher exits.
 
 ## Notes
 
