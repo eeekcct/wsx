@@ -6,8 +6,8 @@ use std::process::Command;
 use crate::config::ResolvedWorkspace;
 
 // Reserve stdout (fd 3) for the snapshot and send ordinary .envrc output to
-// stderr. Hide fd 3 while sourcing so external commands cannot inherit the
-// capture pipe; the shell saves/restores it with close-on-exec.
+// stderr. Temporarily hide fd 3 from sourced code; the shell saves/restores it
+// internally. Background work may still inherit saved handles and delay EOF.
 // Keep sourcing out of a conditional so an explicit `set -e` still
 // works in bash. A case statement preserves the source status without exporting
 // a temporary variable under `set -a`. The fixed NUL prefix distinguishes an
@@ -287,7 +287,11 @@ mod tests {
                 .env("WSX_TEST_BASEDIR", &environment["WSX_TEST_BASEDIR"])
                 .output()
                 .expect("convert Git Bash workspace path");
-            assert!(output.status.success());
+            assert!(
+                output.status.success(),
+                "cygpath failed: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
             let path = String::from_utf8(output.stdout).expect("UTF-8 workspace path");
             assert_eq!(
                 fs::canonicalize(path.trim()).expect("envrc directory exists"),
@@ -501,19 +505,20 @@ mod tests {
     }
 
     #[test]
-    fn shell_wrappers_wait_for_capture_eof_not_every_background_descendant() {
+    fn shell_wrappers_wait_for_inherited_capture_pipes() {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
         for &(shell, source_command) in shell_wrappers() {
-            for (child_start, child_end, should_finish_before_release) in
-                [("sh -c '", "'", true), ("{", "}", false)]
-            {
+            for (child_start, child_end, redirections, must_wait_for_release) in [
+                ("sh -c '", "'", "</dev/null >/dev/null 2>&1", false),
+                ("{", "}", "</dev/null", true),
+            ] {
                 let workspace = TestWorkspace::new();
                 fs::write(
                     workspace.0.join(".envrc"),
                     format!(
-                        "{child_start}\n{}\n{child_end} </dev/null >/dev/null 2>&1 &\n{}",
+                        "{child_start}\n{}\n{child_end} {redirections} &\n{}",
                         concat!(
                             "  : > child-started\n",
                             "  attempt=0\n",
@@ -553,7 +558,7 @@ mod tests {
                         let received = receiver.recv_timeout(Duration::from_secs(5));
                         let finished_before_release = received.is_ok();
                         // Always release the child, including when capture is still waiting
-                        // for the shell group's copy of the saved snapshot descriptor.
+                        // for an inherited diagnostic or saved snapshot descriptor.
                         fs::write(workspace.0.join("child-release"), "")
                             .expect("release background child");
                         let output = received.unwrap_or_else(|_| {
@@ -578,10 +583,15 @@ mod tests {
                 assert!(wrapper_exited, "{shell}: wrapper must reach shell exit");
                 assert!(output.status.success(), "{shell}: {:?}", output.stderr);
                 assert!(parse_env_output(&output.stdout).is_ok());
-                assert_eq!(
-                    finished_before_release, should_finish_before_release,
-                    "{shell}: external commands close the saved pipe on exec, but shell groups retain it",
-                );
+                if must_wait_for_release {
+                    assert!(
+                        !finished_before_release,
+                        "{shell}: inherited capture pipes must reach EOF before returning",
+                    );
+                }
+                // A fully redirected external command may still retain the shell's
+                // internally saved descriptor. Its timing is shell-specific; either
+                // way, releasing it must permit a complete, valid capture above.
             }
         }
     }

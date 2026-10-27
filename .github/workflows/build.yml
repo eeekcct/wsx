@@ -20,7 +20,12 @@ jobs:
 
       - name: Run unit tests (including native Git Bash on Windows)
         shell: bash
-        run: cargo test --release --verbose --bin wsx
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # Keep child bash/cygpath on Git Bash, ahead of the runner's Cygwin.
+            export PATH="/usr/bin:/bin:$PATH"
+          fi
+          cargo test --release --verbose --bin wsx
 
       - name: Run e2e tests
         run: cargo test --release --verbose --test e2e_cli -- --test-threads=1
