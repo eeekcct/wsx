@@ -169,7 +169,7 @@ mod tests {
         #[cfg(unix)]
         let path = "/usr/bin:/bin".to_string();
         #[cfg(windows)]
-        let path = std::env::var("PATH").expect("PATH is needed to find Git Bash and env");
+        let path = std::env::var("PATH").expect("PATH is needed to find native Bash and env");
         #[allow(unused_mut)]
         let mut environment = HashMap::from([
             ("PATH".to_string(), path),
@@ -255,16 +255,26 @@ mod tests {
             "WSX_TEST_PRIORITY=dotenv\nWSX_TEST_DOTENV_ONLY=retained\n",
         )
         .expect("write dotenv");
+        let cwd_marker = Uuid::new_v4().to_string();
+        fs::write(workspace.0.join("cwd-marker"), &cwd_marker).expect("write cwd marker");
         fs::write(
             workspace.0.join(".envrc"),
             concat!(
                 "[ \"$WSX_TEST_PRIORITY\" = dotenv ] || return 81\n",
+                "[ \"$PWD\" -ef \"$WSX_TEST_EXPECTED_DIRECTORY\" ] || return 82\n",
+                "export WSX_TEST_CWD_MARKER=\"$(cat ./cwd-marker)\"\n",
                 "export WSX_TEST_PRIORITY=envrc\n",
                 "export WSX_TEST_BASEDIR=\"$PWD\"\n",
             ),
         )
         .expect("write successful envrc");
         let mut environment = initial_environment();
+        // Let the same shell compare actual directory identity, accepting both
+        // native Windows paths and Git Bash/Cygwin's POSIX view of the workspace.
+        environment.insert(
+            "WSX_TEST_EXPECTED_DIRECTORY".to_string(),
+            workspace.0.to_string_lossy().replace('\\', "/"),
+        );
 
         apply_dotenv_files(&workspace.0, &[".env".to_string()], &mut environment)
             .expect("apply dotenv layer");
@@ -273,31 +283,12 @@ mod tests {
 
         assert_eq!(environment["WSX_TEST_PRIORITY"], "envrc");
         assert_eq!(environment["WSX_TEST_DOTENV_ONLY"], "retained");
+        assert_eq!(environment["WSX_TEST_CWD_MARKER"], cwd_marker);
         #[cfg(unix)]
         assert_eq!(
             fs::canonicalize(&environment["WSX_TEST_BASEDIR"]).expect("envrc directory exists"),
             fs::canonicalize(&workspace.0).expect("workspace directory exists"),
         );
-        #[cfg(windows)]
-        {
-            // Git Bash exposes PWD as /c/...; convert it before comparing with
-            // the native Windows path, without weakening the cwd assertion.
-            let output = Command::new("bash")
-                .args(["-c", "cygpath -w -- \"$WSX_TEST_BASEDIR\""])
-                .env("WSX_TEST_BASEDIR", &environment["WSX_TEST_BASEDIR"])
-                .output()
-                .expect("convert Git Bash workspace path");
-            assert!(
-                output.status.success(),
-                "cygpath failed: {}",
-                String::from_utf8_lossy(&output.stderr),
-            );
-            let path = String::from_utf8(output.stdout).expect("UTF-8 workspace path");
-            assert_eq!(
-                fs::canonicalize(path.trim()).expect("envrc directory exists"),
-                fs::canonicalize(&workspace.0).expect("workspace directory exists"),
-            );
-        }
     }
 
     #[test]
@@ -675,9 +666,10 @@ mod tests {
         apply_envrc(&workspace.0, &mut environment).expect("run Windows production Bash wrapper");
 
         assert!(!environment["WSX_TEST_BASH_VERSION"].is_empty());
-        assert_eq!(
-            environment["WSX_TEST_OSTYPE"], "msys",
-            "must use native Git Bash, not WSL"
+        assert!(
+            matches!(environment["WSX_TEST_OSTYPE"].as_str(), "msys" | "cygwin"),
+            "must use native Windows Bash, not WSL: {}",
+            environment["WSX_TEST_OSTYPE"],
         );
     }
 
