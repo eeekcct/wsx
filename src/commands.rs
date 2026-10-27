@@ -480,7 +480,7 @@ fn cleanup_workspace_instances(
         });
     }
 
-    candidates.sort_by(|a, b| b.modified.cmp(&a.modified));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.modified));
 
     let mut kept = 0usize;
     for instance in candidates {
