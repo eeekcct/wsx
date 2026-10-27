@@ -207,18 +207,38 @@ If the selected process has `default_stream`, it becomes `<name>:<stream>`.
 
 - Unix: a non-login `sh -c` sources `.envrc` with `set -a`.
 - Windows: a non-login `bash -c` sources `.envrc` with `set -a`.
-- After successful sourcing, `wsx` captures `env -0` output after a unique marker.
-  `unset` removes inherited OS/dotenv variables, multiline and empty values are
-  preserved, and text printed by `.envrc` is not interpreted as environment data.
+- After successful sourcing, `wsx` captures `env -0` on a dedicated output
+  descriptor, with a fixed NUL prefix to detect a missing snapshot. Ordinary
+  `.envrc` stdout is redirected to captured stderr, never parsed as environment
+  data. Captured output is suppressed on success and included in execution-failure
+  diagnostics.
+- `unset` removes inherited OS/dotenv variables; multiline and empty values are
+  preserved.
 
 Notes:
 
 - `.envrc` is evaluated with a non-login shell (`-c`) for deterministic PATH/toolchain behavior.
 - If `envrc: true` but `.envrc` is missing, it is skipped.
 - On Windows, if `bash` is not found, `.envrc` is skipped with warning.
+- Use `.envrc` for short, non-interactive environment setup. `wsx` waits for the
+  evaluation shell to finish and for its captured output pipes to close before
+  starting workspace processes. Background work that inherits a pipe (including
+  a shell-internal saved descriptor) can therefore delay startup indefinitely.
+  This is not a guarantee that all descendants have finished: a background
+  command that releases those pipes may keep running. Define long-running
+  services in `processes`, not `.envrc`.
+- Finish setup work before returning from `.envrc`. If you start concurrent jobs,
+  explicitly `wait` for each one and propagate any required failure status
+  (for example, `wait "$pid" || return $?`). Pipe capture does not enforce
+  child-before-parent completion or replace these explicit waits.
+- Background child processes cannot change the parent shell's environment. Their
+  printed output is diagnostic text, not an additional environment snapshot.
+- Shell startup hooks (such as Bash `BASH_ENV`) must not print to stdout before
+  the capture wrapper starts; unexpected output fails snapshot validation.
 - `.envrc` evaluation requires an `env` command supporting `-0` (GNU coreutils and
   current macOS provide it). Unsupported or malformed output fails startup rather
-  than applying a partial environment.
+  than applying a partial environment. Exiting early, even with `exit 0`, fails
+  because no snapshot was captured.
 - If sourcing `.envrc` returns a non-zero status, workspace startup fails.
 - No implicit `set -e` is applied: `.envrc` retains normal shell status rules.
   A failed command followed by a successful command may still return success.
