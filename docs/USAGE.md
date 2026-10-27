@@ -81,6 +81,7 @@ Run an arbitrary command in the current workspace context.
 
 - Uses current workspace directory as `cwd`.
 - Applies workspace env resolution order: OS -> dotenv -> envrc.
+- Requires a command; omitting it is a usage error (exit status `2`).
 - Passes args directly (no implicit shell wrapping).
 - Shell aliases and builtins are not resolved by default.
   On Windows, `cat` is a PowerShell alias and cannot be executed directly with `wsx exec`.
