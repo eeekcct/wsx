@@ -100,6 +100,28 @@ If empty, target is resolved from process settings (see resolution order below).
 - Type: string
 - Required: yes
 - Constraint: must exist and must be a directory
+- Absolute paths are recommended when a workspace name should always refer to the same checkout.
+- A relative path is resolved against the directory where you run `wsx select <name>`
+  or `wsx <name>`, not against the config directory.
+- Selection saves the canonical absolute workspace directory in `current.json`
+  (`workspace_path`). This also resolves symlinks at selection time.
+- Subsequent `up` and `exec` use that saved directory, even after you change directories
+  or edit this configured path. Run `select` again (or `wsx <name>`) to choose a new path.
+- Relative dotenv paths and `.envrc` are resolved within the selected workspace
+  directory. Absolute dotenv paths are used unchanged. Started applications use
+  the selected workspace as their working directory for their own relative file I/O.
+- On Windows, prefer absolute executable paths and absolute `PATH` entries:
+  executable lookup for a relative `cmd[0]` can differ from the child's working directory.
+- `~` and environment variables in `path` are not expanded.
+
+For example, selecting `path: ./project` from `/home/me/dev` saves
+`/home/me/dev/project`. Later running `wsx exec` from `/tmp` still uses that project.
+
+**Existing state:** Older `current.json` files may not contain `workspace_path`.
+An absolute configured path can be migrated safely by `up` or `exec`. For a relative
+configured path, run `wsx select <name>` again from the intended directory before
+`up` or `exec`; wsx will not guess the original selection directory. `down` and
+`status` remain available. No config file is rewritten automatically.
 
 ### `stop.grace_seconds` (optional)
 

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::PathBuf;
 
 use crate::paths;
 
@@ -28,6 +29,8 @@ fn default_current_status() -> CurrentStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentState {
     pub workspace: String,
+    #[serde(default)]
+    pub workspace_path: Option<PathBuf>,
     #[serde(default)]
     pub instance_id: Option<String>,
     pub started_at: DateTime<Utc>,
@@ -138,6 +141,21 @@ mod tests {
         let current: CurrentState = serde_json::from_str(raw).expect("deserialize current");
         assert_eq!(current.status, CurrentStatus::Running);
         assert_eq!(current.instance_id.as_deref(), Some("inst"));
+        assert_eq!(current.workspace_path, None);
+    }
+
+    #[test]
+    fn current_path_roundtrips_and_remains_optional() {
+        let current = CurrentState {
+            workspace: "demo".to_string(),
+            workspace_path: Some(std::env::current_dir().expect("current directory")),
+            instance_id: None,
+            started_at: Utc::now(),
+            status: CurrentStatus::Stopped,
+        };
+        let raw = serde_json::to_string(&current).expect("serialize current state");
+        let decoded: CurrentState = serde_json::from_str(&raw).expect("parse current state");
+        assert_eq!(decoded.workspace_path, current.workspace_path);
     }
 
     #[test]
