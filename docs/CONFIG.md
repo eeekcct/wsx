@@ -201,19 +201,27 @@ If the selected process has `default_stream`, it becomes `<name>:<stream>`.
 
 1. OS environment
 2. dotenv files (in configured order, last write wins)
-3. `.envrc` (when enabled, final overwrite)
+3. `.envrc` (when enabled, its resulting environment replaces the previous layer)
 
 ### `.envrc` execution
 
-- Unix: `sh -c "set -a; . ./.envrc; env"`
-- Windows: `bash -c "set -a; source ./.envrc; env"`
+- Unix: a non-login `sh -c` sources `.envrc` with `set -a`.
+- Windows: a non-login `bash -c` sources `.envrc` with `set -a`.
+- After successful sourcing, `wsx` captures `env -0` output after a unique marker.
+  `unset` removes inherited OS/dotenv variables, multiline and empty values are
+  preserved, and text printed by `.envrc` is not interpreted as environment data.
 
 Notes:
 
 - `.envrc` is evaluated with a non-login shell (`-c`) for deterministic PATH/toolchain behavior.
 - If `envrc: true` but `.envrc` is missing, it is skipped.
 - On Windows, if `bash` is not found, `.envrc` is skipped with warning.
-- If `.envrc` execution fails, workspace startup fails.
+- `.envrc` evaluation requires an `env` command supporting `-0` (GNU coreutils and
+  current macOS provide it). Unsupported or malformed output fails startup rather
+  than applying a partial environment.
+- If sourcing `.envrc` returns a non-zero status, workspace startup fails.
+- No implicit `set -e` is applied: `.envrc` retains normal shell status rules.
+  A failed command followed by a successful command may still return success.
 
 ## Common Errors
 
