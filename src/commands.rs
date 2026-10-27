@@ -222,15 +222,16 @@ fn handle_follow_outcome(outcome: logs::FollowOutcome) -> Result<()> {
 }
 
 fn exec_current(cmd: Vec<String>) -> Result<()> {
+    let (program, args) = cmd.split_first().context("exec requires a command")?;
     let current = load_current_reconciled()?.context("no current workspace")?;
 
     let config = Config::load()?;
     let workspace = config.resolve_workspace(&current.workspace)?;
     let env_map = env::build_environment(&workspace)?;
 
-    let mut command = ProcessCommand::new(&cmd[0]);
+    let mut command = ProcessCommand::new(program);
     command
-        .args(&cmd[1..])
+        .args(args)
         .current_dir(&workspace.path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -480,7 +481,7 @@ fn cleanup_workspace_instances(
         });
     }
 
-    candidates.sort_by(|a, b| b.modified.cmp(&a.modified));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.modified));
 
     let mut kept = 0usize;
     for instance in candidates {
