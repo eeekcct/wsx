@@ -72,19 +72,15 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<FollowO
     let err = PathBuf::from(&entry.err_log);
     let combined = PathBuf::from(&entry.combined_log);
 
-    rebuild_combined(&out, &err, &combined)?;
-
-    print_last_lines(&combined, lines)?;
+    let snapshot = rebuild_combined(&out, &err, &combined)?;
+    print_last_lines(&snapshot.content, lines);
 
     if !follow {
         return Ok(FollowOutcome::Completed);
     }
 
     let control = FollowControl::new()?;
-    let mut out_pos = file_len(&out)?;
-    let mut err_pos = file_len(&err)?;
-    let mut combined_pos = file_len(&combined)?;
-
+    let mut offsets = snapshot.offsets;
     let mut sleep_backoff = BACKOFF_MIN_MS;
 
     loop {
@@ -92,40 +88,18 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<FollowO
             return Ok(outcome);
         }
 
-        let mut had_delta = false;
-
-        let out_delta = read_from_offset(&out, out_pos)?;
-        if !out_delta.is_empty() {
-            append_to_file(&combined, &out_delta)?;
-            out_pos += out_delta.len() as u64;
-            had_delta = true;
-        }
-
-        let err_delta = read_from_offset(&err, err_pos)?;
-        if !err_delta.is_empty() {
-            append_to_file(&combined, &err_delta)?;
-            err_pos += err_delta.len() as u64;
-            had_delta = true;
-        }
-
-        let combined_delta = read_from_offset(&combined, combined_pos)?;
-        if !combined_delta.is_empty() {
-            print!("{}", String::from_utf8_lossy(&combined_delta));
+        // Check completion before draining. If the process exits during the
+        // read, the next iteration drains its final bytes using the same offsets.
+        let completed = !is_pid_running(entry.pid);
+        let delta = read_combined_delta(&out, &err, &mut offsets)?;
+        let had_delta = !delta.is_empty();
+        if had_delta {
+            append_to_file(&combined, &delta)?;
+            print!("{}", String::from_utf8_lossy(&delta));
             std::io::stdout().flush().ok();
-            combined_pos += combined_delta.len() as u64;
-            had_delta = true;
         }
-
-        if !had_delta && !is_pid_running(entry.pid) {
-            rebuild_combined(&out, &err, &combined)?;
-            let final_delta = read_from_offset(&combined, combined_pos)?;
-            if final_delta.is_empty() {
-                return Ok(FollowOutcome::Completed);
-            }
-
-            print!("{}", String::from_utf8_lossy(&final_delta));
-            std::io::stdout().flush().ok();
-            combined_pos += final_delta.len() as u64;
+        if completed && !had_delta {
+            return Ok(FollowOutcome::Completed);
         }
 
         sleep_backoff = next_backoff_ms(sleep_backoff, had_delta);
@@ -134,40 +108,33 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<FollowO
 }
 
 fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<FollowOutcome> {
-    ensure_file(path)?;
-    print_last_lines(path, lines)?;
+    let snapshot = read_log_snapshot(path)?;
+    print_last_lines(&snapshot, lines);
 
     if !follow {
         return Ok(FollowOutcome::Completed);
     }
 
     let control = FollowControl::new()?;
-    let mut pos = file_len(path)?;
+    // Advance only past bytes in the displayed snapshot. Stat'ing the file here
+    // could skip bytes appended between the initial read and this offset capture.
+    let mut pos = snapshot.len() as u64;
     let mut sleep_backoff = BACKOFF_MIN_MS;
     loop {
         if let Some(outcome) = control.poll()? {
             return Ok(outcome);
         }
 
-        let mut had_delta = false;
-
+        let completed = !is_pid_running(pid);
         let delta = read_from_offset(path, pos)?;
-        if !delta.is_empty() {
+        let had_delta = !delta.is_empty();
+        if had_delta {
             print!("{}", String::from_utf8_lossy(&delta));
             std::io::stdout().flush().ok();
             pos += delta.len() as u64;
-            had_delta = true;
         }
-
-        if !had_delta && !is_pid_running(pid) {
-            let final_delta = read_from_offset(path, pos)?;
-            if final_delta.is_empty() {
-                return Ok(FollowOutcome::Completed);
-            }
-
-            print!("{}", String::from_utf8_lossy(&final_delta));
-            std::io::stdout().flush().ok();
-            pos += final_delta.len() as u64;
+        if completed && !had_delta {
+            return Ok(FollowOutcome::Completed);
         }
 
         sleep_backoff = next_backoff_ms(sleep_backoff, had_delta);
@@ -222,21 +189,43 @@ fn available_targets(pids_file: &PidsFile) -> String {
     targets.join(", ")
 }
 
-fn rebuild_combined(out: &Path, err: &Path, combined: &Path) -> Result<()> {
+#[derive(Debug, Default)]
+struct CombinedOffsets {
+    out: u64,
+    err: u64,
+}
+
+struct CombinedSnapshot {
+    content: String,
+    offsets: CombinedOffsets,
+}
+
+fn rebuild_combined(out: &Path, err: &Path, combined: &Path) -> Result<CombinedSnapshot> {
     ensure_file(out)?;
     ensure_file(err)?;
 
-    let out_bytes = fs::read(out).with_context(|| format!("failed to read {}", out.display()))?;
+    let mut bytes = fs::read(out).with_context(|| format!("failed to read {}", out.display()))?;
     let err_bytes = fs::read(err).with_context(|| format!("failed to read {}", err.display()))?;
-
-    let mut file = File::create(combined)
-        .with_context(|| format!("failed to create {}", combined.display()))?;
-    file.write_all(&out_bytes)
+    let offsets = CombinedOffsets {
+        out: bytes.len() as u64,
+        err: err_bytes.len() as u64,
+    };
+    bytes.extend_from_slice(&err_bytes);
+    fs::write(combined, &bytes)
         .with_context(|| format!("failed to write {}", combined.display()))?;
-    file.write_all(&err_bytes)
-        .with_context(|| format!("failed to write {}", combined.display()))?;
+    let content = String::from_utf8(bytes)
+        .with_context(|| format!("failed to read {} as UTF-8", combined.display()))?;
 
-    Ok(())
+    Ok(CombinedSnapshot { content, offsets })
+}
+
+fn read_combined_delta(out: &Path, err: &Path, offsets: &mut CombinedOffsets) -> Result<Vec<u8>> {
+    let mut bytes = read_from_offset(out, offsets.out)?;
+    let err_bytes = read_from_offset(err, offsets.err)?;
+    offsets.out += bytes.len() as u64;
+    offsets.err += err_bytes.len() as u64;
+    bytes.extend_from_slice(&err_bytes);
+    Ok(bytes)
 }
 
 fn append_to_file(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -267,26 +256,17 @@ fn read_from_offset(path: &Path, offset: u64) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-fn print_last_lines(path: &Path, lines: usize) -> Result<()> {
+fn read_log_snapshot(path: &Path) -> Result<String> {
     ensure_file(path)?;
+    fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
+}
 
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+fn print_last_lines(content: &str, lines: usize) {
     let rows: Vec<&str> = content.lines().collect();
-
     let start = rows.len().saturating_sub(lines);
     for row in &rows[start..] {
         println!("{row}");
     }
-
-    Ok(())
-}
-
-fn file_len(path: &Path) -> Result<u64> {
-    ensure_file(path)?;
-    Ok(fs::metadata(path)
-        .with_context(|| format!("failed to stat {}", path.display()))?
-        .len())
 }
 
 fn ensure_file(path: &Path) -> Result<()> {
@@ -408,6 +388,62 @@ fn is_pid_running(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TempLogs(PathBuf);
+
+    impl TempLogs {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("wsx-log-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).expect("create log fixture");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempLogs {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn combined_offsets_track_the_exact_snapshot_and_drain_each_byte_once() {
+        let fixture = TempLogs::new();
+        let out = fixture.0.join("out.log");
+        let err = fixture.0.join("err.log");
+        let combined = fixture.0.join("combined.log");
+        fs::write(&out, "before-out\n").expect("write stdout");
+        fs::write(&err, "before-err\n").expect("write stderr");
+        let snapshot = rebuild_combined(&out, &err, &combined).expect("initial snapshot");
+        assert_eq!(snapshot.content, "before-out\nbefore-err\n");
+        let mut offsets = snapshot.offsets;
+
+        // These writes deliberately happen after the initial read, the race
+        // window where taking fresh file lengths used to discard output.
+        append_to_file(&out, b"late-out\n").expect("append stdout");
+        append_to_file(&err, b"late-err\n").expect("append stderr");
+        assert_eq!(
+            read_combined_delta(&out, &err, &mut offsets).expect("drain final bytes"),
+            b"late-out\nlate-err\n"
+        );
+        assert!(
+            read_combined_delta(&out, &err, &mut offsets)
+                .expect("repeat drain")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn single_stream_offset_does_not_skip_bytes_after_initial_snapshot() {
+        let fixture = TempLogs::new();
+        let path = fixture.0.join("out.log");
+        fs::write(&path, "before\n").expect("write stdout");
+        let snapshot = read_log_snapshot(&path).expect("initial snapshot");
+        append_to_file(&path, "日本語 after\n".as_bytes()).expect("append stdout");
+        assert_eq!(
+            read_from_offset(&path, snapshot.len() as u64).expect("read new bytes"),
+            "日本語 after\n".as_bytes()
+        );
+    }
 
     #[test]
     fn parses_target_formats() {
