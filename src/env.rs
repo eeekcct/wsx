@@ -5,14 +5,10 @@ use std::process::Command;
 
 use crate::config::ResolvedWorkspace;
 
-// Reserve stdout (fd 3) for the snapshot and send ordinary .envrc output to
-// stderr. Temporarily hide fd 3 from sourced code; the shell saves/restores it
-// internally. Background work may still inherit saved handles and delay EOF.
-// Keep sourcing out of a conditional so an explicit `set -e` still
-// works in bash. A case statement preserves the source status without exporting
-// a temporary variable under `set -a`. The fixed NUL prefix distinguishes an
-// empty snapshot from an .envrc that exits before capture; no log scanning is
-// needed because the snapshot has its own output channel.
+// Isolate the snapshot on fd 3; send .envrc output to stderr and hide fd 3
+// while sourcing. Inherited shell-saved handles can still delay EOF.
+// Source outside conditionals to honor explicit `set -e`; use case to avoid
+// exporting a status variable. The NUL prefix distinguishes empty/missing snapshots.
 fn envrc_script(source_command: &str) -> String {
     format!(
         "exec 3>&1 1>&2; set -a; {source_command} ./.envrc 3>&-; case $? in 0) printf '\\0' >&3; env -0 >&3 ;; *) exit $? ;; esac"
@@ -269,8 +265,7 @@ mod tests {
         )
         .expect("write successful envrc");
         let mut environment = initial_environment();
-        // Let the same shell compare actual directory identity, accepting both
-        // native Windows paths and Git Bash/Cygwin's POSIX view of the workspace.
+        // Compare directory identity in-shell across Windows/POSIX path formats.
         environment.insert(
             "WSX_TEST_EXPECTED_DIRECTORY".to_string(),
             workspace.0.to_string_lossy().replace('\\', "/"),
@@ -548,8 +543,7 @@ mod tests {
                         let wrapper_exited = workspace.0.join("wrapper-exited").exists();
                         let received = receiver.recv_timeout(Duration::from_secs(5));
                         let finished_before_release = received.is_ok();
-                        // Always release the child, including when capture is still waiting
-                        // for an inherited diagnostic or saved snapshot descriptor.
+                        // Release inherited pipes even if capture is still blocked.
                         fs::write(workspace.0.join("child-release"), "")
                             .expect("release background child");
                         let output = received.unwrap_or_else(|_| {
@@ -580,9 +574,7 @@ mod tests {
                         "{shell}: inherited capture pipes must reach EOF before returning",
                     );
                 }
-                // A fully redirected external command may still retain the shell's
-                // internally saved descriptor. Its timing is shell-specific; either
-                // way, releasing it must permit a complete, valid capture above.
+                // Saved descriptors make fully redirected child timing shell-specific.
             }
         }
     }
@@ -607,8 +599,7 @@ mod tests {
             let environment = parse_env_output(&output.stdout).expect("parent snapshot");
             assert_eq!(environment["WSX_TEST_PARENT"], "parent");
             assert!(!environment.contains_key("WSX_TEST_CHILD"));
-            // The child's env -0 is ordinary .envrc stdout, even when delayed.
-            // It belongs entirely to the diagnostic stream, not the snapshot.
+            // Delayed child stdout is diagnostic output, not the parent snapshot.
             let diagnostic_environment = parse_env_output(&[&b"\0"[..], &output.stderr].concat())
                 .expect("child environment emitted only to stderr");
             assert_eq!(diagnostic_environment["WSX_TEST_CHILD"], "child");
