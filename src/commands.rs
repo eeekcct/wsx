@@ -270,7 +270,7 @@ fn print_process_overview(instance_id: &str) -> Result<()> {
     };
 
     for entry in pids.entries {
-        let status = if process::is_pid_running(entry.pid) {
+        let status = if process::is_process_tree_running(&entry) {
             "running"
         } else {
             "stopped"
@@ -340,11 +340,8 @@ fn load_current_reconciled() -> Result<Option<CurrentState>> {
         }
     };
 
-    let has_running_pid = pids
-        .entries
-        .iter()
-        .any(|entry| process::is_pid_running(entry.pid));
-    if !has_running_pid {
+    let has_running_process_tree = pids.entries.iter().any(process::is_process_tree_running);
+    if !has_running_process_tree {
         save_current_stopped(&mut current, false)?;
     }
 
