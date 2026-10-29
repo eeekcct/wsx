@@ -5,10 +5,7 @@ use std::process::Command;
 
 use crate::config::ResolvedWorkspace;
 
-// Isolate the snapshot on fd 3; send .envrc output to stderr and hide fd 3
-// while sourcing. Inherited shell-saved handles can still delay EOF.
-// Source outside conditionals to honor explicit `set -e`; use case to avoid
-// exporting a status variable. The NUL prefix distinguishes empty/missing snapshots.
+// Source outside conditionals to preserve explicit `set -e` behavior.
 fn envrc_script(source_command: &str) -> String {
     format!(
         "exec 3>&1 1>&2; set -a; {source_command} ./.envrc 3>&-; case $? in 0) printf '\\0' >&3; env -0 >&3 ;; *) exit $? ;; esac"
