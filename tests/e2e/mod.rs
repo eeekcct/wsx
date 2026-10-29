@@ -3,3 +3,5 @@ mod linux;
 mod macos;
 mod metadata_errors;
 mod windows;
+
+mod log_replay;
