@@ -54,12 +54,13 @@ pub struct PidsFile {
 
 pub fn load_current() -> Result<Option<CurrentState>> {
     let path = paths::current_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let raw =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
     let state: CurrentState = serde_json::from_str(&raw)
         .with_context(|| format!("invalid JSON in {}", path.display()))?;
 
@@ -73,14 +74,6 @@ pub fn save_current(state: &CurrentState) -> Result<()> {
     let raw = serde_json::to_string_pretty(state)?;
     fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
 
-    Ok(())
-}
-
-pub fn clear_current() -> Result<()> {
-    let path = paths::current_path()?;
-    if path.exists() {
-        fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
-    }
     Ok(())
 }
 
