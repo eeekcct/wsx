@@ -18,7 +18,8 @@ jobs:
       - name: Build with Cargo
         run: cargo build --release --verbose
 
-      - name: Run unit tests
+      - name: Run unit tests (including native Windows Bash)
+        shell: bash
         run: cargo test --release --verbose --bin wsx
 
       - name: Run e2e tests

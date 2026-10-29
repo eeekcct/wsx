@@ -201,19 +201,24 @@ If the selected process has `default_stream`, it becomes `<name>:<stream>`.
 
 1. OS environment
 2. dotenv files (in configured order, last write wins)
-3. `.envrc` (when enabled, final overwrite)
+3. `.envrc` (when enabled, its resulting environment replaces the previous layer)
 
 ### `.envrc` execution
 
-- Unix: `sh -c "set -a; . ./.envrc; env"`
-- Windows: `bash -c "set -a; source ./.envrc; env"`
-
-Notes:
-
-- `.envrc` is evaluated with a non-login shell (`-c`) for deterministic PATH/toolchain behavior.
-- If `envrc: true` but `.envrc` is missing, it is skipped.
-- On Windows, if `bash` is not found, `.envrc` is skipped with warning.
-- If `.envrc` execution fails, workspace startup fails.
+- Sources `.envrc` with `set -a` in a non-login shell: `sh -c` on Unix,
+  `bash -c` on Windows. Missing `.envrc` is skipped; missing Bash on Windows
+  produces a warning and skips evaluation.
+- `unset` removes inherited variables; multiline and empty values are preserved.
+  Ordinary output is kept separate, suppressed on success, and included in
+  execution-failure diagnostics.
+- Use short, non-interactive setup; put services in `processes`. Startup waits
+  for the shell and captured pipes to close, not necessarily all descendants.
+  Inherited pipes (including shell-saved handles) can block startup indefinitely.
+- Explicitly wait for concurrent setup jobs and propagate failures, e.g.
+  `wait "$pid" || return $?`. Background jobs cannot change the parent environment.
+- Requires `env -0`. Non-zero source status, invalid snapshots, early `exit`
+  (even `exit 0`), or startup-hook stdout (e.g. `BASH_ENV`) fail startup.
+- No implicit `set -e`: a failed command followed by a successful one may succeed.
 
 ## Common Errors
 
