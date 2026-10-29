@@ -397,6 +397,39 @@ mod linux_e2e {
         Path::new("/proc").join(pid.to_string()).exists()
     }
 
+    // Match only processes in this test's unique directory. Unlike a PID-file
+    // handshake, this also handles rollback before a child gets to run any code.
+    fn workspace_process_pids(workspace: &Path) -> Vec<u32> {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let pid = entry.file_name().to_string_lossy().parse::<u32>().ok()?;
+                (fs::read_link(entry.path().join("cwd")).ok()?.as_path() == workspace)
+                    .then_some(pid)
+            })
+            .collect()
+    }
+
+    struct WorkspaceProcessCleanup(PathBuf);
+
+    impl Drop for WorkspaceProcessCleanup {
+        fn drop(&mut self) {
+            for pid in workspace_process_pids(&self.0) {
+                if let Ok(raw_pid) = i32::try_from(pid) {
+                    let _ = kill(Pid::from_raw(-raw_pid), Signal::SIGKILL);
+                    let _ = kill(Pid::from_raw(raw_pid), Signal::SIGKILL);
+                }
+            }
+        }
+    }
+
+    fn process_is_live(pid: u32) -> bool {
+        read_proc_state(pid).is_some_and(|state| !matches!(state, 'Z' | 'X'))
+    }
+
     fn read_proc_state(pid: u32) -> Option<char> {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let close_paren = stat.rfind(')')?;
@@ -1945,5 +1978,99 @@ workspaces:
         let result = env.run(&["unknown"]);
         assert_failure(&result);
         assert!(stderr(&result).contains("workspace `unknown` is not defined"));
+    }
+
+    #[test]
+    fn log_open_failure_stops_previously_started_processes() {
+        let env = TestEnv::new("log-open-rollback");
+        let demo = env.create_workspace("demo");
+        let _cleanup = WorkspaceProcessCleanup(demo.clone());
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+workspaces:
+  demo:
+    path: {}
+    processes:
+      - name: first
+        cmd: ["/bin/sleep", "60"]
+      - name: missing/child
+        cmd: ["/bin/sleep", "60"]
+"#,
+            yaml_path(&demo),
+        ));
+        let output = env.run(&["demo"]);
+        assert_failure(&output);
+        assert_stderr_contains(&output, "failed to open");
+        assert_stderr_contains(&output, "missing/child.out.log");
+        assert!(current_meta(&env).is_none());
+        // Reaching the second process's log file means the first spawn succeeded.
+        // Check the unique cwd, not a child-written PID file that successful
+        // rollback can prevent from ever being written.
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                workspace_process_pids(&demo)
+                    .into_iter()
+                    .all(|pid| !process_is_live(pid))
+            }),
+            "a child survived failure to open the next process's log file"
+        );
+    }
+
+    #[test]
+    fn current_state_write_failure_stops_started_processes() {
+        let env = TestEnv::new("current-write-rollback");
+        let demo = env.create_workspace("demo");
+        let _cleanup = WorkspaceProcessCleanup(demo.clone());
+        // This runs after reading the old current state but before persisting the
+        // newly spawned instance, deterministically making that write fail.
+        fs::write(
+            demo.join(".envrc"),
+            "mkdir \"$HOME/.config/wsx/current.json\"\n",
+        )
+        .expect("write envrc failure fixture");
+        env.write_config(&format!(
+            r#"defaults:
+  stop:
+    grace_seconds: 1
+workspaces:
+  demo:
+    path: {}
+    env:
+      envrc: true
+    processes:
+      - name: sleeper
+        cmd: ["/bin/sleep", "60"]
+"#,
+            yaml_path(&demo),
+        ));
+        let output = env.run(&["demo"]);
+        assert_failure(&output);
+        assert_stderr_contains(&output, "failed to write");
+        assert_stderr_contains(&output, "current.json");
+        assert!(env.wsx_home().join("current.json").is_dir());
+        let pid_files = fs::read_dir(env.wsx_home().join("instances"))
+            .expect("read instances")
+            .flatten()
+            .map(|entry| entry.path().join("pids.json"))
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pid_files.len(),
+            1,
+            "spawn should have reached metadata persistence"
+        );
+        let pids: PidsMeta = serde_json::from_str(
+            &fs::read_to_string(&pid_files[0]).expect("read persisted pid metadata"),
+        )
+        .expect("parse pid metadata");
+        assert_eq!(pids.entries.len(), 1);
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                pids.entries.iter().all(|entry| !process_is_live(entry.pid))
+            }),
+            "a child survived failure to persist current state"
+        );
     }
 }

@@ -1,12 +1,13 @@
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessStatus, System};
 
-use crate::config::ResolvedWorkspace;
+use crate::config::{ResolvedProcess, ResolvedWorkspace};
 use crate::paths;
 use crate::state::{PidEntry, PidsFile};
 
@@ -41,77 +42,15 @@ pub fn start_workspace(
     let mut entries = Vec::with_capacity(workspace.processes.len());
 
     for process in &workspace.processes {
-        let out_path = logs_dir.join(format!("{}.out.log", process.name));
-        let err_path = logs_dir.join(format!("{}.err.log", process.name));
-        let combined_path = logs_dir.join(format!("{}.combined.log", process.name));
-
-        let out_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&out_path)
-            .with_context(|| format!("failed to open {}", out_path.display()))?;
-
-        let err_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&err_path)
-            .with_context(|| format!("failed to open {}", err_path.display()))?;
-
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&combined_path)
-            .with_context(|| format!("failed to open {}", combined_path.display()))?;
-
-        let mut command = Command::new(&process.cmd[0]);
-        command
-            .args(&process.cmd[1..])
-            .current_dir(&workspace.path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(out_file))
-            .stderr(Stdio::from(err_file))
-            .env_clear()
-            .envs(env_map.iter());
-
-        apply_spawn_settings(&mut command);
-
-        let child = command.spawn().with_context(|| {
-            format!(
-                "failed to start process `{}` using command {:?}",
-                process.name, process.cmd
-            )
-        });
-
-        let mut child = match child {
-            Ok(child) => child,
+        match start_process(workspace, process, instance_id, &logs_dir, env_map) {
+            Ok(entry) => entries.push(entry),
             Err(err) => {
-                cleanup_partial_entries(workspace, instance_id, &entries);
+                if let Err(stop_err) = cleanup_partial_entries(workspace, instance_id, &entries) {
+                    return Err(err).context(format!("startup rollback also failed: {stop_err:#}"));
+                }
                 return Err(err);
             }
-        };
-
-        let windows_job_name = match attach_process_tracking(instance_id, &process.name, &child) {
-            Ok(value) => value,
-            Err(err) => {
-                let pid = child.id();
-                rollback_untracked_child(&mut child);
-                cleanup_partial_entries(workspace, instance_id, &entries);
-                bail!(
-                    "failed to attach process `{}` (pid {}) to tracking: {err:#}",
-                    process.name,
-                    pid
-                );
-            }
-        };
-
-        entries.push(PidEntry {
-            name: process.name.clone(),
-            pid: child.id(),
-            out_log: out_path.to_string_lossy().to_string(),
-            err_log: err_path.to_string_lossy().to_string(),
-            combined_log: combined_path.to_string_lossy().to_string(),
-            windows_job_name,
-        });
+        }
     }
 
     Ok(PidsFile {
@@ -121,9 +60,84 @@ pub fn start_workspace(
     })
 }
 
-fn cleanup_partial_entries(workspace: &ResolvedWorkspace, instance_id: &str, entries: &[PidEntry]) {
+fn start_process(
+    workspace: &ResolvedWorkspace,
+    process: &ResolvedProcess,
+    instance_id: &str,
+    logs_dir: &Path,
+    env_map: &HashMap<String, String>,
+) -> Result<PidEntry> {
+    let out_path = logs_dir.join(format!("{}.out.log", process.name));
+    let err_path = logs_dir.join(format!("{}.err.log", process.name));
+    let combined_path = logs_dir.join(format!("{}.combined.log", process.name));
+
+    let out_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&out_path)
+        .with_context(|| format!("failed to open {}", out_path.display()))?;
+
+    let err_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&err_path)
+        .with_context(|| format!("failed to open {}", err_path.display()))?;
+
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&combined_path)
+        .with_context(|| format!("failed to open {}", combined_path.display()))?;
+
+    let mut command = Command::new(&process.cmd[0]);
+    command
+        .args(&process.cmd[1..])
+        .current_dir(&workspace.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::from(err_file))
+        .env_clear()
+        .envs(env_map.iter());
+
+    apply_spawn_settings(&mut command);
+
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to start process `{}` using command {:?}",
+            process.name, process.cmd
+        )
+    })?;
+
+    let windows_job_name = match attach_process_tracking(instance_id, &process.name, &child) {
+        Ok(value) => value,
+        Err(err) => {
+            let pid = child.id();
+            rollback_untracked_child(&mut child);
+            bail!(
+                "failed to attach process `{}` (pid {}) to tracking: {err:#}",
+                process.name,
+                pid
+            );
+        }
+    };
+
+    Ok(PidEntry {
+        name: process.name.clone(),
+        pid: child.id(),
+        out_log: out_path.to_string_lossy().to_string(),
+        err_log: err_path.to_string_lossy().to_string(),
+        combined_log: combined_path.to_string_lossy().to_string(),
+        windows_job_name,
+    })
+}
+
+fn cleanup_partial_entries(
+    workspace: &ResolvedWorkspace,
+    instance_id: &str,
+    entries: &[PidEntry],
+) -> Result<()> {
     if entries.is_empty() {
-        return;
+        return Ok(());
     }
 
     let partial = PidsFile {
@@ -131,7 +145,7 @@ fn cleanup_partial_entries(workspace: &ResolvedWorkspace, instance_id: &str, ent
         instance_id: instance_id.to_string(),
         entries: entries.to_vec(),
     };
-    let _ = stop_workspace(&partial, workspace.grace_seconds);
+    stop_workspace(&partial, workspace.grace_seconds)
 }
 
 pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
