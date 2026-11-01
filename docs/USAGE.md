@@ -23,6 +23,11 @@ Switch to a workspace.
 
 - Stops the current running workspace first.
 - Starts the target workspace processes.
+- Invalid target configuration is rejected before stopping the current workspace.
+- If environment loading or process startup fails after the current workspace is stopped,
+  the previous workspace remains stopped; it is not restarted automatically.
+- Failed startup rolls back processes already started for the target workspace.
+  If rollback itself fails, the error includes that failure rather than hiding it.
 - Saves runtime metadata to `~/.config/wsx/current.json` and `instances/<id>/pids.json`.
 - Starts log follow for the configured default log target.
 - During log follow, press `q` then Enter to detach without stopping processes.

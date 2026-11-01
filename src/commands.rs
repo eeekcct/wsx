@@ -84,13 +84,20 @@ fn start_workspace_instance(workspace: &ResolvedWorkspace, action: &str) -> Resu
 
     let pids = process::start_workspace(workspace, &instance_id, &env_map)?;
 
-    state::save_pids(&pids)?;
-    state::save_current(&CurrentState {
-        workspace: workspace.name.clone(),
-        instance_id: Some(instance_id),
-        started_at: Utc::now(),
-        status: CurrentStatus::Running,
-    })?;
+    let saved = state::save_pids(&pids).and_then(|()| {
+        state::save_current(&CurrentState {
+            workspace: workspace.name.clone(),
+            instance_id: Some(instance_id),
+            started_at: Utc::now(),
+            status: CurrentStatus::Running,
+        })
+    });
+    if let Err(err) = saved {
+        if let Err(stop_err) = process::stop_workspace(&pids, workspace.grace_seconds) {
+            return Err(err).context(format!("startup rollback also failed: {stop_err:#}"));
+        }
+        return Err(err);
+    }
 
     println!("{action} workspace `{}`", workspace.name);
     traxer::info!("{action} workspace `{}`", workspace.name);
