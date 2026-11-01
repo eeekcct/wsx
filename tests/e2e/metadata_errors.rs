@@ -287,7 +287,15 @@ fn inaccessible_current_state_is_not_mistaken_for_absent_state() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        assert!(String::from_utf8_lossy(&output.stderr).contains("failed to read"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Lock acquisition now precedes reading current.json and can encounter
+        // the inaccessible directory first. Both must fail closed.
+        assert!(
+            stderr.contains("failed to read")
+                || stderr.contains("failed to create")
+                || stderr.contains("failed to open lifecycle lock"),
+            "unexpected inaccessible-state error: {stderr}"
+        );
     }
     drop(permissions);
     assert_eq!(

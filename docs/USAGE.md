@@ -93,7 +93,8 @@ Show logs for current workspace.
 - If the current workspace has no running instance, prints a notice and exits successfully.
 - Without `--no-follow`, logs are followed:
   - press `q` then Enter to detach
-  - press `Ctrl+C` to stop the current workspace before exiting
+  - press `Ctrl+C` to stop the followed instance before exiting (a replacement
+    selected or started by another terminal is not stopped)
   - on Unix, follow ends when the target's managed process group disappears and
     its final logs have been drained, even if the original launcher exits earlier;
     unrelated service groups do not keep that target's follow open
@@ -141,6 +142,21 @@ Show runtime status.
 ## Notes
 
 - `wsx` state is stored under `~/.config/wsx`.
+- Lifecycle operations and state reconciliation are serialized across processes using
+  `lifecycle.lock` in that state directory. Concurrent `up` commands cannot both start
+  the same selected instance. Different state directories remain independent.
+  Use this version in all terminals; older versions do not participate in locking.
+- The lock covers environment loading, startup, stop confirmation, and state updates,
+  not log following or the command launched by `exec`. A slow `.envrc` or stop can
+  therefore delay other lifecycle commands. Do not synchronously invoke same-state-root
+  `wsx` commands (other than `list`) from `.envrc`: they would wait on the caller’s lock.
+  `exec` uses the workspace snapshot it
+  prepared even if another terminal subsequently changes the selection.
+- The OS releases the lock when its owner exits; the lock file normally remains and
+  must not be deleted while commands are active. JSON files are replaced atomically
+  so readers do not observe partially written documents. This is not a transaction
+  across process creation and multiple files: a crash during startup can still need
+  manual recovery; do not remove metadata while services may be running.
 - If running-state or PID metadata is unreadable or inconsistent, lifecycle commands fail
   without deleting it or declaring the workspace stopped. Repair the metadata before
   retrying; do not delete it while managed processes may still be running. This prevents
