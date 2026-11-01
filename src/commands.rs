@@ -153,7 +153,8 @@ fn down_current(config: Option<&Config>) -> Result<()> {
     })?;
 
     let grace_seconds = resolve_grace_seconds(config, &current.workspace);
-    process::stop_workspace(&pids_file, grace_seconds)?;
+    process::stop_workspace(&pids_file, grace_seconds)
+        .context("stop confirmation failed; runtime metadata preserved")?;
     save_current_stopped(&mut current)?;
     let keep_instances = resolve_keep_instances(config, &current.workspace);
     cleanup_workspace_instances(&current.workspace, keep_instances, Some(&instance_id))?;
@@ -244,7 +245,7 @@ fn print_process_overview(current: &CurrentState, instance_id: &str) -> Result<(
     })?;
 
     for entry in pids.entries {
-        let status = if process::is_pid_running(entry.pid) {
+        let status = if process::is_process_tree_running(&entry) {
             "running"
         } else {
             "stopped"
@@ -302,11 +303,8 @@ fn load_current_reconciled() -> Result<Option<CurrentState>> {
         )
     })?;
 
-    let has_running_pid = pids
-        .entries
-        .iter()
-        .any(|entry| process::is_pid_running(entry.pid));
-    if !has_running_pid {
+    let has_running_process_tree = pids.entries.iter().any(process::is_process_tree_running);
+    if !has_running_process_tree {
         save_current_stopped(&mut current)?;
     }
 

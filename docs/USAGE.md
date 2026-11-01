@@ -55,7 +55,20 @@ Stop the current running workspace.
 
 - Sends graceful stop first, then force stop if needed.
 - On Windows, graceful stop uses `taskkill`, and force stop uses Windows Job Object termination.
-- If processes still remain after stop attempts, command fails.
+- If processes still remain after stop attempts, command fails. A timeout reports
+  each remaining service name and saved PGID (Unix) or PID (Windows), because
+  termination could not be confirmed.
+- During Unix stop polling, wsx nonblockingly reaps only each saved PID if it is
+  its own exited direct child. It does not enumerate or reap unrelated processes.
+- On Linux, an unreaped zombie owned by another process can keep a group present even though no member is executing.
+  In that case `down` can fail after the configured grace period plus approximately
+  20 seconds of force-stop retries. SIGKILL cannot remove a zombie; its parent (or
+  the adopting reaper) must collect its exit status.
+- On such a failure, current state remains `running`, and the instance ID and
+  `pids.json` are retained. A subsequent `up` reports already running without launching
+  duplicates while the group still exists. Once it has been reaped and the group is
+  gone, `status`/`up` can reconcile it as stopped. Workspace switching also fails
+  rather than abandoning an instance that could not be stopped.
 - Keeps `current.json` and sets current state to `stopped` on success.
 - If there is no running instance, prints a notice and exits successfully.
 
@@ -99,6 +112,11 @@ Show runtime status.
 - Current state (`running` or `stopped`)
 - Current instance id (`(none)` when no running instance) and start time
 - Per-process pid and `running`/`stopped`
+- On Unix, `running` means a managed process group still exists, checked with signal zero
+  (no signal is delivered). The launcher itself need not still exist.
+- This is not a live-process check: Linux also reports unreaped zombies. Other Unix
+  kernels may report zombie-only groups differently. Permission-denied or unexpected
+  probe errors are conservatively treated as running.
 
 ## Notes
 
