@@ -896,11 +896,13 @@ workspaces:
     }
 
     #[test]
-    fn down_recovers_when_running_instance_metadata_is_missing() {
+    fn missing_running_metadata_fails_closed_until_restored() {
         let env = TestEnv::new("nonlinux-down-missing-pids");
         let demo = env.create_workspace("demo");
         let short_cmd = python_cmd(r#"import time; print("short", flush=True); time.sleep(1)"#);
-        let long_cmd = python_cmd(r#"import time; print("long", flush=True); time.sleep(30)"#);
+        let long_cmd = python_cmd(
+            r#"import time; log = open("launch-count.txt", "a"); log.write("started\n"); log.close(); time.sleep(60)"#,
+        );
 
         env.write_config(&format!(
             r#"defaults:
@@ -924,25 +926,117 @@ workspaces:
             long_cmd,
         ));
 
-        let switch = env.run(&["demo"]);
-        assert_success(&switch);
-
+        // Do not capture a pipe here: on Windows the long-lived process may
+        // inherit it, delaying output() until that process exits naturally.
+        assert_status_success(env.run_status(&["demo"]));
+        let current_path = env.wsx_home().join("current.json");
+        let current_before = fs::read(&current_path).expect("read original current state");
         let instance_id =
             current_instance_id(&env).expect("current instance should exist after switch");
-        let pids_path = env
-            .wsx_home()
-            .join("instances")
-            .join(instance_id)
-            .join("pids.json");
-        fs::remove_file(&pids_path).expect("failed to remove pids.json");
+        let instances_path = env.wsx_home().join("instances");
+        let pids_path = instances_path.join(&instance_id).join("pids.json");
+        let pids_before = fs::read(&pids_path).expect("read original pid metadata");
+        let owned_pids = current_process_pids(&env).expect("record owned pids before corruption");
 
+        struct RestoreMetadataAndStop<'a> {
+            env: &'a TestEnv,
+            path: PathBuf,
+            original: Vec<u8>,
+            current_path: PathBuf,
+            current_original: Vec<u8>,
+            armed: bool,
+        }
+
+        impl Drop for RestoreMetadataAndStop<'_> {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                let _ = fs::write(&self.path, &self.original);
+                let _ = fs::write(&self.current_path, &self.current_original);
+                // Best-effort cleanup also runs after assertion failures. Use
+                // status(), not a captured pipe, and never signal guessed PIDs.
+                let _ = Command::new(env!("CARGO_BIN_EXE_wsx"))
+                    .arg("down")
+                    .env("HOME", &self.env.home_dir)
+                    .env("USERPROFILE", &self.env.home_dir)
+                    .env("HOMEDRIVE", "")
+                    .env("HOMEPATH", "")
+                    .env_remove("WSX_HOME")
+                    .status();
+            }
+        }
+
+        let mut cleanup = RestoreMetadataAndStop {
+            env: &env,
+            path: pids_path.clone(),
+            original: pids_before.clone(),
+            current_path: current_path.clone(),
+            current_original: current_before.clone(),
+            armed: true,
+        };
+        let long_pid = *owned_pids.last().expect("long-lived process pid");
+        assert!(pid_exists(long_pid), "long-lived process should still run");
+        let launch_count_path = demo.join("launch-count.txt");
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fs::read_to_string(&launch_count_path)
+                    .is_ok_and(|contents| contents.lines().count() == 1)
+            }),
+            "long-lived process did not record its initial launch"
+        );
+        let launches_before = fs::read(&launch_count_path).expect("read launch counter");
+        let instances_before = fs::read_dir(&instances_path)
+            .expect("read original instances")
+            .count();
+        fs::remove_file(&pids_path).expect("remove only this fixture's pid metadata");
+
+        for args in [
+            &["down"][..],
+            &["status"][..],
+            &["up"][..],
+            &["logs", "--no-follow"][..],
+        ] {
+            let output = env.run(args);
+            assert_failure(&output);
+            assert_stderr_contains(&output, "runtime metadata");
+            assert_eq!(
+                fs::read(&current_path).expect("current state must remain repairable"),
+                current_before,
+                "wsx {args:?} must not change uncertain current state"
+            );
+            assert!(
+                !pids_path.exists(),
+                "must not fabricate replacement metadata"
+            );
+            assert!(
+                pid_exists(long_pid),
+                "must not stop a process without metadata"
+            );
+            assert_eq!(
+                fs::read(&launch_count_path).expect("read unchanged launch counter"),
+                launches_before,
+                "wsx {args:?} must not launch a duplicate process"
+            );
+            assert_eq!(
+                fs::read_dir(&instances_path)
+                    .expect("read instances")
+                    .count(),
+                instances_before,
+                "wsx {args:?} must not create another instance"
+            );
+        }
+
+        fs::write(&pids_path, &pids_before).expect("restore original pid metadata");
+        assert_eq!(current_process_pids(&env), Some(owned_pids.clone()));
         let down = env.run(&["down"]);
         assert_success(&down);
-        assert_stdout_contains_all(&down, &["marked as stopped"]);
-
-        let meta = current_meta(&env).expect("current should exist after recovery");
+        assert_down_succeeded_message(&down, "demo");
+        assert_no_running_pids(&owned_pids, Duration::from_secs(5));
+        let meta = current_meta(&env).expect("current should remain after verified stop");
         assert_eq!(meta.status.as_deref(), Some("stopped"));
-        assert_eq!(meta.instance_id, None);
+        assert_eq!(meta.instance_id.as_deref(), Some(instance_id.as_str()));
+        cleanup.armed = false;
     }
 
     #[test]
