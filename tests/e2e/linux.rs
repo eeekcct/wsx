@@ -1785,8 +1785,11 @@ workspaces:
             yaml_path(&demo),
         ));
 
-        let switch = env.run(&["demo"]);
-        assert_success(&switch);
+        let mut switch = env.spawn_with_pty(&["demo"], &[]);
+        assert!(
+            wait_for_current_status(&env, "running", Duration::from_secs(5)),
+            "workspace should become running while descendant logs are followed"
+        );
 
         assert!(
             wait_until(Duration::from_secs(2), || child_pid_path.exists()),
@@ -1798,8 +1801,17 @@ workspaces:
             .parse()
             .expect("child pid must be numeric");
         assert!(
-            pid_exists(child_pid),
+            process_is_live(child_pid),
             "background child process should be running before down"
+        );
+        // The launcher exiting no longer completes follow while its child lives.
+        // Explicitly detach, rather than relying on that premature-completion bug.
+        switch.write_bytes(b"q\n");
+        assert!(switch.wait_for_exit(Duration::from_secs(5)).success());
+        switch.assert_terminal_restored();
+        assert!(
+            process_is_live(child_pid),
+            "detach must leave the child running"
         );
         let managed_root_pids =
             current_process_pids(&env).expect("managed pids should exist before down");

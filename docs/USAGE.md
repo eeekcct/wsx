@@ -94,7 +94,14 @@ Show logs for current workspace.
 - Without `--no-follow`, logs are followed:
   - press `q` then Enter to detach
   - press `Ctrl+C` to stop the current workspace before exiting
-  - follow ends automatically when target process stops and no new log is appended
+  - on Unix, follow ends when the target's managed process group disappears and
+    its final logs have been drained, even if the original launcher exits earlier;
+    unrelated service groups do not keep that target's follow open
+  - on Windows, completion continues to track the target process
+  - on Linux, a zombie owned by another process can keep the group present and
+    follow open until its parent/reaper collects it; use `q` + Enter to detach or
+    `--no-follow` for a snapshot. There is no idle-output timeout that could drop
+    delayed descendant output
 
 ### `wsx exec <cmd...>`
 

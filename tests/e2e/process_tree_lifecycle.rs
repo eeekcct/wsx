@@ -36,7 +36,16 @@ impl Fixture {
             config_dir.join("config.yaml"),
             json!({
                 "defaults": {"stop": {"grace_seconds": 0}, "env": {"dotenv": [], "envrc": false}},
-                "workspaces": {"demo": {"path": workspace, "processes": [{"name": "launcher", "cmd": command}]}}
+                "workspaces": {"demo": {
+                    "path": workspace,
+                    // Startup follows only this finite service. A live launcher
+                    // group now correctly keeps its own log follower attached.
+                    "logs": {"default": "bootstrap"},
+                    "processes": [
+                        {"name": "launcher", "cmd": command},
+                        {"name": "bootstrap", "cmd": ["/bin/sh", "-c", "exit 0"]}
+                    ]
+                }}
             })
             .to_string(),
         )
@@ -64,7 +73,11 @@ import ctypes, json, os, pathlib, subprocess, sys
 if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
     raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
 p = subprocess.Popen(sys.argv[2:], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-out, err = p.communicate()
+try:
+    out, err = p.communicate(timeout=30)
+except subprocess.TimeoutExpired:
+    p.kill()
+    out, err = p.communicate()
 path = pathlib.Path(sys.argv[1])
 tmp = path.with_suffix(".tmp")
 tmp.write_text(json.dumps([p.returncode, list(out), list(err)]))
@@ -141,6 +154,10 @@ while True:
     }
 
     fn remember_child(&mut self) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !self.workspace.join("child.pid").exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         let pid = fs::read_to_string(self.workspace.join("child.pid"))
             .expect("child handshake")
             .trim()
@@ -154,10 +171,12 @@ while True:
 impl Drop for Fixture {
     fn drop(&mut self) {
         // The marker also covers an assertion failure before remember_child().
-        if let Ok(raw) = fs::read_to_string(self.workspace.join("child.pid"))
-            && let Ok(pid) = raw.trim().parse::<u32>()
-        {
-            self.child_pids.push(pid);
+        for marker in ["child.pid", "other.pid"] {
+            if let Ok(raw) = fs::read_to_string(self.workspace.join(marker))
+                && let Ok(pid) = raw.trim().parse::<u32>()
+            {
+                self.child_pids.push(pid);
+            }
         }
         for pid in &self.child_pids {
             // Only clean our known child while it still belongs to this fixture.
@@ -416,4 +435,99 @@ fn zombie_only_group_remains_running_and_failed_down_retains_metadata() {
     wait_for_reaped(pid);
     fixture.run(&["down"]);
     assert_eq!(fixture.current()["status"], "stopped");
+}
+
+#[test]
+fn logs_follow_reaped_launcher_descendants_on_each_stream_not_other_services() {
+    let mut fixture = Fixture::new(&[
+        "/bin/sh",
+        "-c",
+        "/bin/sh -c 'echo $$ > child.pid; while [ ! -e release ]; do /bin/sleep 0.01; done; /bin/sleep 0.2; printf \"LATE_OUT\\n\"; printf \"LATE_ERR\\n\" >&2' & while [ ! -s child.pid ]; do /bin/sleep 0.01; done",
+    ]);
+    let config_path = fixture.home.join(".config/wsx/config.yaml");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["workspaces"]["demo"]["processes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name": "other", "cmd": ["/bin/sh", "-c", "echo $$ > other.pid; exec /bin/sleep 60"]}));
+    fs::write(config_path, config.to_string()).unwrap();
+    fixture.run(&["demo"]);
+    let child = fixture.remember_child();
+    let leader = fixture.root_pid();
+    wait_for_reaped(leader);
+    assert_eq!(
+        proc_state_and_group(child).map(|(_, group)| group),
+        Some(leader)
+    );
+
+    let mut followers = Vec::new();
+    for target in ["launcher", "launcher:out", "launcher:err"] {
+        let follower = Command::new(env!("CARGO_BIN_EXE_wsx"))
+            .args(["logs", target])
+            .current_dir(&fixture.outside)
+            .env_clear()
+            .env("HOME", &fixture.home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("WSX_LOG", "error")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start log follower");
+        followers.push((target, follower));
+    }
+    // A reaped launcher must not make a quiet, still-live descendant look done.
+    // Release the child only after all followers have had time to observe it.
+    thread::sleep(Duration::from_millis(300));
+    let prematurely_exited = followers
+        .iter_mut()
+        .any(|(_, child)| child.try_wait().unwrap().is_some());
+    fs::write(fixture.workspace.join("release"), "go").unwrap();
+    let mut outputs = Vec::new();
+    for (target, mut follower) in followers {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while follower.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let timed_out = follower.try_wait().unwrap().is_none();
+        if timed_out {
+            follower.kill().unwrap();
+        }
+        let output = follower.wait_with_output().unwrap();
+        outputs.push((target, timed_out, output));
+    }
+    for (target, timed_out, output) in outputs {
+        assert!(!timed_out, "{target} waited for an unrelated service group");
+        assert!(output.status.success(), "{target}: {:?}", output);
+        let lines: Vec<_> = std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .lines()
+            .collect();
+        for marker in ["LATE_OUT", "LATE_ERR"] {
+            let expected = usize::from(
+                target == "launcher" || (target.ends_with(":out") == (marker == "LATE_OUT")),
+            );
+            assert_eq!(
+                lines.iter().filter(|line| **line == marker).count(),
+                expected,
+                "{target}: {lines:?}"
+            );
+        }
+    }
+    assert!(
+        !prematurely_exited,
+        "followers exited while a descendant could still write"
+    );
+    wait_for_reaped(child);
+    let other: u32 = fs::read_to_string(fixture.workspace.join("other.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        is_live(other),
+        "unrelated configured service should remain live"
+    );
+    fixture.run(&["down"]);
+    wait_for_reaped(other);
 }
