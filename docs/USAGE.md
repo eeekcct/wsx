@@ -102,6 +102,7 @@ Run an arbitrary command in the current workspace context.
 
 - Uses the directory saved when the current workspace was selected as `cwd`.
 - Applies workspace env resolution order: OS -> dotenv -> envrc.
+- Requires a command; omitting it is a usage error (exit status `2`).
 - Passes args directly (no implicit shell wrapping).
 - Normal child exit codes are propagated. Spawn failures and signal termination return `1`.
 - Shell aliases and builtins are not resolved by default.
