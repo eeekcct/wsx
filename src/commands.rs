@@ -19,7 +19,10 @@ pub fn run(cli: Cli) -> Result<()> {
         (Some(workspace), None) => switch_workspace(&workspace),
         (None, Some(Command::List)) => list_workspaces(),
         (None, Some(Command::Up)) => up_current(),
-        (None, Some(Command::Down)) => down_current(None),
+        (None, Some(Command::Down)) => {
+            let _lock = state::acquire_lifecycle_lock()?;
+            down_current(None)
+        }
         (
             None,
             Some(Command::Logs {
@@ -37,7 +40,7 @@ pub fn run(cli: Cli) -> Result<()> {
 }
 
 fn select_workspace(target: &str) -> Result<()> {
-    paths::ensure_home_layout()?;
+    let _lock = state::acquire_lifecycle_lock()?;
     let config = Config::load()?;
     let workspace = config.resolve_workspace(target)?;
     down_current(Some(&config))?;
@@ -55,32 +58,38 @@ fn select_workspace(target: &str) -> Result<()> {
 }
 
 fn switch_workspace(workspace_name: &str) -> Result<()> {
-    paths::ensure_home_layout()?;
-
-    let config = Config::load()?;
-    let workspace = config.resolve_workspace(workspace_name)?;
-
-    down_current(Some(&config))?;
-
-    start_workspace_instance(&workspace, "switched to")
+    let (workspace, pids) = {
+        let _lock = state::acquire_lifecycle_lock()?;
+        let config = Config::load()?;
+        let workspace = config.resolve_workspace(workspace_name)?;
+        down_current(Some(&config))?;
+        let pids = start_workspace_instance(&workspace, "switched to")?;
+        (workspace, pids)
+    };
+    follow_workspace_instance(&workspace, &pids)
 }
 
 fn up_current() -> Result<()> {
-    paths::ensure_home_layout()?;
-    let current = load_current_reconciled()?.context("no current workspace")?;
+    let (workspace, pids) = {
+        let _lock = state::acquire_lifecycle_lock()?;
+        let current = load_current_reconciled()?.context("no current workspace")?;
 
-    if current.status == CurrentStatus::Running {
-        println!("workspace `{}` is already running", current.workspace);
-        return Ok(());
-    }
+        if current.status == CurrentStatus::Running {
+            println!("workspace `{}` is already running", current.workspace);
+            return Ok(());
+        }
 
-    let config = Config::load()?;
-    let workspace =
-        config.resolve_current_workspace(&current.workspace, current.workspace_path.as_deref())?;
-    start_workspace_instance(&workspace, "started")
+        let config = Config::load()?;
+        let workspace = config
+            .resolve_current_workspace(&current.workspace, current.workspace_path.as_deref())?;
+        let pids = start_workspace_instance(&workspace, "started")?;
+        (workspace, pids)
+    };
+    follow_workspace_instance(&workspace, &pids)
 }
 
-fn start_workspace_instance(workspace: &ResolvedWorkspace, action: &str) -> Result<()> {
+// The caller owns the lifecycle transaction, including the initial state check.
+fn start_workspace_instance(workspace: &ResolvedWorkspace, action: &str) -> Result<PidsFile> {
     let env_map = env::build_environment(workspace)?;
     let instance_id = Uuid::new_v4().to_string();
 
@@ -104,14 +113,19 @@ fn start_workspace_instance(workspace: &ResolvedWorkspace, action: &str) -> Resu
 
     println!("{action} workspace `{}`", workspace.name);
     traxer::info!("{action} workspace `{}`", workspace.name);
-    let follow_outcome =
-        logs::show_logs(&pids, &workspace.logs_default, workspace.logs_lines, true)?;
-    handle_follow_outcome(follow_outcome)?;
     cleanup_workspace_instances(
         &workspace.name,
         workspace.logs_keep_instances,
         Some(&pids.instance_id),
     )?;
+    Ok(pids)
+}
+
+// Called after the lifecycle transaction, so followers cannot block other commands.
+fn follow_workspace_instance(workspace: &ResolvedWorkspace, pids: &PidsFile) -> Result<()> {
+    let follow_outcome =
+        logs::show_logs(pids, &workspace.logs_default, workspace.logs_lines, true)?;
+    handle_follow_outcome(follow_outcome, &pids.instance_id)?;
 
     Ok(())
 }
@@ -136,6 +150,7 @@ fn list_workspaces() -> Result<()> {
     Ok(())
 }
 
+// Called only while the caller holds the lifecycle lock (also used by select/switch).
 fn down_current(config: Option<&Config>) -> Result<()> {
     let current = state::load_current()
         .context("cannot stop workspace: current state is unreadable; state was preserved")?;
@@ -176,52 +191,72 @@ fn down_current(config: Option<&Config>) -> Result<()> {
 }
 
 fn logs_current(target: Option<String>, lines: Option<usize>, follow: bool) -> Result<()> {
-    let current = load_current_reconciled()?.context("no current workspace")?;
-    let Some(instance_id) = current.instance_id.clone() else {
-        println!("no running instance");
-        return Ok(());
+    let (pids, instance_id, resolved_target, resolved_lines) = {
+        let _lock = state::acquire_lifecycle_lock()?;
+        let current = load_current_reconciled()?.context("no current workspace")?;
+        let Some(instance_id) = current.instance_id.clone() else {
+            println!("no running instance");
+            return Ok(());
+        };
+        let pids = load_current_pids(&current, &instance_id).with_context(|| {
+            format!(
+                "cannot show logs for instance `{instance_id}`: runtime metadata is unreadable or inconsistent; state was preserved"
+            )
+        })?;
+
+        let (default_target, default_lines) = resolve_log_defaults(&current.workspace, &pids);
+
+        let resolved_target = target.unwrap_or(default_target);
+        let resolved_lines = lines.unwrap_or(default_lines);
+        (pids, instance_id, resolved_target, resolved_lines)
     };
-    let pids = load_current_pids(&current, &instance_id).with_context(|| {
-        format!(
-            "cannot show logs for instance `{instance_id}`: runtime metadata is unreadable or inconsistent; state was preserved"
-        )
-    })?;
-
-    let (default_target, default_lines) = resolve_log_defaults(&current.workspace, &pids);
-
-    let resolved_target = target.unwrap_or(default_target);
-    let resolved_lines = lines.unwrap_or(default_lines);
-
     let follow_outcome = logs::show_logs(&pids, &resolved_target, resolved_lines, follow)?;
     if follow {
-        handle_follow_outcome(follow_outcome)?;
+        handle_follow_outcome(follow_outcome, &instance_id)?;
     }
     Ok(())
 }
 
-fn handle_follow_outcome(outcome: logs::FollowOutcome) -> Result<()> {
+fn handle_follow_outcome(outcome: logs::FollowOutcome, followed_instance_id: &str) -> Result<()> {
     if outcome != logs::FollowOutcome::Interrupted {
         return Ok(());
     }
 
     traxer::info!("interrupt received (Ctrl+C); stopping workspace...");
-    down_current(None).context("failed to stop workspace after Ctrl+C")?;
+    {
+        let _lock = state::acquire_lifecycle_lock()?;
+        let current = state::load_current()?;
+        // A different terminal may have switched while we followed the old instance.
+        // Never stop its replacement in response to this follower's Ctrl+C.
+        if current
+            .as_ref()
+            .and_then(|state| state.instance_id.as_deref())
+            == Some(followed_instance_id)
+        {
+            down_current(None).context("failed to stop workspace after Ctrl+C")?;
+        }
+    }
     std::process::exit(130);
 }
 
 fn exec_current(cmd: Vec<String>) -> Result<()> {
     let (program, args) = cmd.split_first().context("exec requires a command")?;
-    let mut current = load_current_reconciled()?.context("no current workspace")?;
+    let (workspace, env_map) = {
+        let _lock = state::acquire_lifecycle_lock()?;
+        let mut current = load_current_reconciled()?.context("no current workspace")?;
 
-    let config = Config::load()?;
-    let workspace =
-        config.resolve_current_workspace(&current.workspace, current.workspace_path.as_deref())?;
-    let env_map = env::build_environment(&workspace)?;
-    if current.workspace_path.is_none() {
-        current.workspace_path = Some(workspace.path.clone());
-        state::save_current(&current)?;
-    }
+        let config = Config::load()?;
+        let workspace = config
+            .resolve_current_workspace(&current.workspace, current.workspace_path.as_deref())?;
+        let env_map = env::build_environment(&workspace)?;
+        if current.workspace_path.is_none() {
+            current.workspace_path = Some(workspace.path.clone());
+            state::save_current(&current)?;
+        }
+        (workspace, env_map)
+    };
 
+    // Execute against this snapshot without holding the lifecycle lock.
     let mut command = ProcessCommand::new(program);
     command
         .args(args)
@@ -277,6 +312,7 @@ fn print_process_overview(current: &CurrentState, instance_id: &str) -> Result<(
 }
 
 fn status_current() -> Result<()> {
+    let _lock = state::acquire_lifecycle_lock()?;
     let current = load_current_reconciled().context("cannot determine workspace status")?;
 
     let Some(current) = current else {
@@ -301,6 +337,7 @@ fn status_current() -> Result<()> {
     print_process_overview(&current, instance_id)
 }
 
+// Reconciliation writes current.json, so callers must hold the lifecycle lock.
 fn load_current_reconciled() -> Result<Option<CurrentState>> {
     let Some(mut current) = state::load_current()? else {
         return Ok(None);

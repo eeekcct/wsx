@@ -20,7 +20,7 @@ It is not production-ready yet, and some commands may fail depending on environm
 
 Download pre-built binaries from [Releases](https://github.com/eeekcct/wsx/releases).
 
-Build from source (optional):
+Build from source (optional; Rust 1.89 or newer):
 
 ```sh
 cargo build --release
