@@ -62,8 +62,8 @@ pub fn show_logs(
 
     match parsed.stream {
         StreamKind::Combined => show_combined(entry, lines, follow),
-        StreamKind::Out => tail_file(&PathBuf::from(&entry.out_log), lines, follow, entry.pid),
-        StreamKind::Err => tail_file(&PathBuf::from(&entry.err_log), lines, follow, entry.pid),
+        StreamKind::Out => tail_file(&PathBuf::from(&entry.out_log), lines, follow, entry),
+        StreamKind::Err => tail_file(&PathBuf::from(&entry.err_log), lines, follow, entry),
     }
 }
 
@@ -90,7 +90,7 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<FollowO
 
         // Check completion before draining. If the process exits during the
         // read, the next iteration drains its final bytes using the same offsets.
-        let completed = !is_pid_running(entry.pid);
+        let completed = !process::is_process_tree_running(entry);
         let delta = read_combined_delta(&out, &err, &mut offsets)?;
         let had_delta = !delta.is_empty();
         if had_delta {
@@ -107,7 +107,7 @@ fn show_combined(entry: &PidEntry, lines: usize, follow: bool) -> Result<FollowO
     }
 }
 
-fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<FollowOutcome> {
+fn tail_file(path: &Path, lines: usize, follow: bool, entry: &PidEntry) -> Result<FollowOutcome> {
     let snapshot = read_log_snapshot(path)?;
     print_last_lines(&snapshot, lines);
 
@@ -125,7 +125,7 @@ fn tail_file(path: &Path, lines: usize, follow: bool, pid: u32) -> Result<Follow
             return Ok(outcome);
         }
 
-        let completed = !is_pid_running(pid);
+        let completed = !process::is_process_tree_running(entry);
         let delta = read_from_offset(path, pos)?;
         let had_delta = !delta.is_empty();
         if had_delta {
@@ -379,10 +379,6 @@ fn should_detach(detach_rx: &Option<Receiver<()>>) -> bool {
             Err(TryRecvError::Disconnected) => false,
         },
     }
-}
-
-fn is_pid_running(pid: u32) -> bool {
-    process::is_pid_running(pid)
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
 use sysinfo::{Pid, ProcessStatus, System};
 
 use crate::config::{ResolvedProcess, ResolvedWorkspace};
@@ -314,16 +315,11 @@ fn running_entries(pids_file: &PidsFile) -> Vec<&PidEntry> {
     pids_file
         .entries
         .iter()
-        .filter(|entry| {
-            #[cfg(unix)]
-            if !unix::reap_tracked_child(entry.pid) {
-                return true;
-            }
-            is_process_tree_running(entry)
-        })
+        .filter(|entry| is_process_tree_running(entry))
         .collect()
 }
 
+#[cfg(windows)]
 pub fn is_pid_running(pid: u32) -> bool {
     let mut system = System::new_all();
     system.refresh_all();
@@ -337,6 +333,13 @@ pub fn is_pid_running(pid: u32) -> bool {
 }
 
 pub fn is_process_tree_running(entry: &PidEntry) -> bool {
+    // During `up`/selection, the launcher may still be our direct child. Reap
+    // only that saved PID so its zombie cannot keep an otherwise empty group
+    // alive. Separate `logs`/`status` invocations simply receive ECHILD.
+    #[cfg(unix)]
+    if !unix::reap_tracked_child(entry.pid) {
+        return true;
+    }
     is_process_tree_running_pid(entry.pid)
 }
 
