@@ -51,7 +51,7 @@ pub enum Command {
         no_follow: bool,
     },
     Exec {
-        #[arg(value_name = "cmd", num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(value_name = "cmd", required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
     Status,
