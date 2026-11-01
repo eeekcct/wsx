@@ -169,7 +169,8 @@ fn down_current(config: Option<&Config>) -> Result<()> {
     };
 
     let grace_seconds = resolve_grace_seconds(config, &current.workspace);
-    process::stop_workspace(&pids_file, grace_seconds)?;
+    process::stop_workspace(&pids_file, grace_seconds)
+        .context("stop confirmation failed; runtime metadata preserved")?;
     save_current_stopped(&mut current, false)?;
     let keep_instances = resolve_keep_instances(config, &current.workspace);
     cleanup_workspace_instances(&current.workspace, keep_instances, Some(&instance_id))?;

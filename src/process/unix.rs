@@ -1,67 +1,51 @@
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
-use nix::unistd::{Pid, getpgid};
-use sysinfo::{ProcessStatus, System};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::Pid;
 
+/// Probe group existence without delivering a signal or enumerating processes.
+/// This is not a live-member count: on Linux, unreaped zombies also keep
+/// a group detectable. Other Unix kernels may report zombie-only groups differently.
 pub fn is_process_group_running(pid: u32) -> bool {
-    let Some(group) = positive_group_pid(pid) else {
+    is_process_group_running_with(pid, |group| kill(group, None))
+}
+
+fn is_process_group_running_with<F>(pid: u32, mut probe: F) -> bool
+where
+    F: FnMut(Pid) -> Result<(), Errno>,
+{
+    let Some(group) = process_group_pid(pid) else {
         return false;
     };
-    let system = System::new_all();
-    let processes = system
-        .processes()
-        .iter()
-        .map(|(pid, process)| (pid.as_u32(), process.status()));
-
-    match snapshot_has_live_group_member(group, processes, |pid| {
-        let raw_pid = i32::try_from(pid).map_err(|_| Errno::EINVAL)?;
-        getpgid(Some(Pid::from_raw(raw_pid)))
-    }) {
-        Ok(running) => running,
+    match probe(group) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(Errno::ESRCH) => false,
         Err(err) => {
-            // A lookup may be denied for an unrelated process. Probe only our
-            // existing group instead of treating every such process as a member.
-            // Signal 0 checks existence/permission without delivering a signal.
-            traxer::warn!(
-                "could not inspect process groups ({err}); checking group {pid} existence"
-            );
-            match kill(Pid::from_raw(-group.as_raw()), None) {
-                Ok(()) | Err(Errno::EPERM) => true,
-                Err(Errno::ESRCH) => false,
-                Err(err) => {
-                    traxer::warn!(
-                        "could not check process group {pid}: {err}; treating it as running"
-                    );
-                    true
-                }
-            }
+            traxer::warn!("could not check process group {pid}: {err}; treating it as running");
+            true
         }
     }
 }
 
-fn snapshot_has_live_group_member<I, F>(
-    group: Pid,
-    processes: I,
-    mut process_group: F,
-) -> Result<bool, Errno>
+/// Reap only the saved PID if it is our exited direct child. Never block or
+/// consume another child's status. A separate wsx invocation gets ECHILD.
+pub fn reap_tracked_child(pid: u32) -> bool {
+    reap_tracked_child_with(pid, |child| waitpid(child, Some(WaitPidFlag::WNOHANG)))
+}
+
+fn reap_tracked_child_with<F>(pid: u32, mut reap: F) -> bool
 where
-    I: IntoIterator<Item = (u32, ProcessStatus)>,
-    F: FnMut(u32) -> Result<Pid, Errno>,
+    F: FnMut(Pid) -> Result<WaitStatus, Errno>,
 {
-    let mut lookup_error = None;
-    for (pid, status) in processes {
-        if matches!(status, ProcessStatus::Zombie | ProcessStatus::Dead) {
-            continue;
+    let Some(child) = positive_group_pid(pid) else {
+        return true;
+    };
+    match reap(child) {
+        Ok(_) | Err(Errno::ECHILD) => true,
+        Err(err) => {
+            traxer::warn!("could not reap tracked child {pid}: {err}; retaining it this poll");
+            false
         }
-        match process_group(pid) {
-            Ok(actual_group) if actual_group == group => return Ok(true),
-            Ok(_) | Err(Errno::ESRCH) => {}
-            Err(err) => lookup_error = Some(err),
-        }
-    }
-    match lookup_error {
-        Some(err) => Err(err),
-        None => Ok(false),
     }
 }
 
@@ -92,58 +76,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finds_live_child_after_group_leader_exits() {
-        let group = Pid::from_raw(42);
-        assert_eq!(
-            snapshot_has_live_group_member(
-                group,
-                [(42, ProcessStatus::Zombie), (43, ProcessStatus::Sleep)],
-                |pid| {
-                    assert_eq!(pid, 43, "zombie leader must be skipped");
-                    Ok(group)
-                },
-            ),
-            Ok(true),
-        );
-    }
-
-    #[test]
-    fn ignores_dead_members_unrelated_groups_and_disappeared_processes() {
-        assert_eq!(
-            snapshot_has_live_group_member(
-                Pid::from_raw(42),
-                [
-                    (42, ProcessStatus::Dead),
-                    (43, ProcessStatus::Zombie),
-                    (44, ProcessStatus::Sleep),
-                    (45, ProcessStatus::Sleep),
-                ],
-                |pid| match pid {
-                    44 => Ok(Pid::from_raw(99)),
-                    45 => Err(Errno::ESRCH),
-                    _ => panic!("dead processes must not be queried"),
-                },
-            ),
-            Ok(false),
-        );
-    }
-
-    #[test]
-    fn denied_lookup_is_not_treated_as_a_gone_process() {
-        assert_eq!(
-            snapshot_has_live_group_member(Pid::from_raw(42), [(43, ProcessStatus::Sleep)], |_| {
-                Err(Errno::EPERM)
-            },),
-            Err(Errno::EPERM),
-        );
-    }
-
-    #[test]
-    fn rejects_special_or_unrepresentable_group_ids() {
+    fn reap_is_limited_to_the_positive_saved_pid() {
+        assert!(reap_tracked_child_with(42, |pid| {
+            assert_eq!(pid, Pid::from_raw(42));
+            Ok(WaitStatus::Exited(pid, 0))
+        }));
+        assert!(reap_tracked_child_with(42, |_| Ok(WaitStatus::StillAlive)));
+        assert!(reap_tracked_child_with(42, |_| Err(Errno::ECHILD)));
+        assert!(!reap_tracked_child_with(42, |_| Err(Errno::EINTR)));
+        assert!(!reap_tracked_child_with(42, |_| Err(Errno::EIO)));
         for pid in [0, 1, u32::MAX] {
+            assert!(reap_tracked_child_with(pid, |_| panic!(
+                "invalid saved PID"
+            )));
+        }
+    }
+
+    #[test]
+    fn probes_the_group_once_without_requiring_its_leader() {
+        let mut calls = 0;
+        assert!(is_process_group_running_with(42, |group| {
+            calls += 1;
+            assert_eq!(group, Pid::from_raw(-42));
+            Ok(())
+        }));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn success_including_zombie_only_existence_is_running() {
+        // A successful probe does not prove a live member exists (e.g. Linux zombies).
+        assert!(is_process_group_running_with(42, |_| Ok(())));
+    }
+
+    #[test]
+    fn permission_denied_is_running() {
+        assert!(is_process_group_running_with(42, |_| Err(Errno::EPERM)));
+    }
+
+    #[test]
+    fn missing_group_is_stopped() {
+        assert!(!is_process_group_running_with(42, |_| Err(Errno::ESRCH)));
+    }
+
+    #[test]
+    fn unexpected_probe_error_is_conservatively_running() {
+        assert!(is_process_group_running_with(42, |_| Err(Errno::EIO)));
+    }
+
+    #[test]
+    fn rejects_special_or_unrepresentable_group_ids_without_probing() {
+        for pid in [0, 1, i32::MAX as u32 + 1, u32::MAX] {
             assert!(process_group_pid(pid).is_none());
-            assert!(!is_process_group_running(pid));
+            assert!(!is_process_group_running_with(pid, |_| {
+                panic!("invalid group IDs must never reach kill")
+            }));
         }
         assert_eq!(process_group_pid(42), Some(Pid::from_raw(-42)));
+        assert_eq!(
+            process_group_pid(i32::MAX as u32),
+            Some(Pid::from_raw(-i32::MAX)),
+        );
     }
 }

@@ -170,13 +170,21 @@ pub fn stop_workspace(pids_file: &PidsFile, grace_seconds: u64) -> Result<()> {
     if !remaining.is_empty() {
         let details = remaining
             .into_iter()
-            .map(|entry| format!("{} (pid {})", entry.name, entry.pid))
+            .map(|entry| remaining_process_label(&entry.name, entry.pid))
             .collect::<Vec<_>>()
             .join(", ");
-        bail!("failed to stop processes: {details}");
+        bail!("failed to stop processes: timed out; unable to confirm termination of: {details}");
     }
 
     Ok(())
+}
+
+fn remaining_process_label(name: &str, pid: u32) -> String {
+    #[cfg(unix)]
+    let id_kind = "PGID";
+    #[cfg(windows)]
+    let id_kind = "PID";
+    format!("{name} ({id_kind} {pid})")
 }
 
 fn force_stop_entry(entry: &PidEntry) -> Result<()> {
@@ -292,7 +300,13 @@ fn running_entries(pids_file: &PidsFile) -> Vec<&PidEntry> {
     pids_file
         .entries
         .iter()
-        .filter(|entry| is_process_tree_running(entry))
+        .filter(|entry| {
+            #[cfg(unix)]
+            if !unix::reap_tracked_child(entry.pid) {
+                return true;
+            }
+            is_process_tree_running(entry)
+        })
         .collect()
 }
 
@@ -385,6 +399,20 @@ fn force_stop_untracked_pid(pid: u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remaining_process_label_identifies_the_saved_target() {
+        #[cfg(unix)]
+        assert_eq!(
+            super::remaining_process_label("web", 12345),
+            "web (PGID 12345)"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            super::remaining_process_label("web", 12345),
+            "web (PID 12345)"
+        );
+    }
+
     use super::{
         ForceStopError, collect_force_stop_errors, force_stop_entry_with,
         rollback_untracked_pid_with, validate_force_errors_with,
