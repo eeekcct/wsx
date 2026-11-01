@@ -286,6 +286,7 @@ fn validate_workspace_path(path: &Path) -> Result<()> {
 fn resolve_processes(items: &[ProcessConfig]) -> Result<Vec<ResolvedProcess>> {
     let mut out = Vec::with_capacity(items.len());
     let mut name_counter: HashMap<String, usize> = HashMap::new();
+    let mut used_names = HashSet::new();
 
     for process in items {
         if process.cmd.is_empty() {
@@ -303,11 +304,16 @@ fn resolve_processes(items: &[ProcessConfig]) -> Result<Vec<ResolvedProcess>> {
         }
 
         let count = name_counter.entry(base_name.clone()).or_insert(0);
-        *count += 1;
-        let resolved_name = if *count == 1 {
-            base_name
-        } else {
-            format!("{}-{}", base_name, *count)
+        let resolved_name = loop {
+            *count += 1;
+            let candidate = if *count == 1 {
+                base_name.clone()
+            } else {
+                format!("{}-{}", base_name, *count)
+            };
+            if used_names.insert(candidate.clone()) {
+                break candidate;
+            }
         };
 
         out.push(ResolvedProcess {
@@ -688,6 +694,29 @@ workspaces:
         let resolved = resolve_processes(&items).expect("resolve");
         assert_eq!(resolved[0].name, "npm");
         assert_eq!(resolved[1].name, "npm-2");
+    }
+
+    #[test]
+    fn generated_process_names_do_not_collide_with_explicit_suffixes() {
+        let items: Vec<_> = ["app", "app", "app-2", "app", "app-2", "app-2-2"]
+            .into_iter()
+            .map(|name| ProcessConfig {
+                name: Some(name.to_string()),
+                cmd: vec!["echo".to_string()],
+                default_log: false,
+                default_stream: None,
+            })
+            .collect();
+        let resolved = resolve_processes(&items).expect("resolve colliding names");
+        let names: Vec<_> = resolved
+            .iter()
+            .map(|process| process.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["app", "app-2", "app-2-2", "app-3", "app-2-3", "app-2-2-2"]
+        );
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), names.len());
     }
 
     #[test]
