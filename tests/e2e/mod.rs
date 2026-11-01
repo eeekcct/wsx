@@ -6,5 +6,6 @@ mod metadata_errors;
 mod windows;
 
 mod exec_usage;
+mod log_replay;
 mod process_names;
 mod process_tree_lifecycle;
